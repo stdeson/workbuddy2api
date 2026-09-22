@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
@@ -51,6 +53,25 @@ type Config struct {
 	SchoolDisabled bool
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
+
+	// RandomWindow 随机每日窗口：启用后四类维护任务合并每天一次、窗口内随机时刻触发。
+	RandomWindowEnabled  bool
+	RandomWindowStartMin int // 窗口起点（距零点分钟数）
+	RandomWindowEndMin   int // 窗口终点（距零点分钟数）
+
+	// 开学季随机时点：启用后每天在 [SchoolRandomStartMin,SchoolRandomEndMin] 随机整分触发一次
+	// （替代固定 SchoolHours）。窗口不跨午夜，需满足 start<end。
+	SchoolRandomEnabled  bool
+	SchoolRandomStartMin int
+	SchoolRandomEndMin   int
+	// 夜猫子随机时点：启用后每天在可跨午夜窗口 [CatRandomStartMin,CatRandomEndMin] 随机生成
+	// CatRandomCount 个时刻触发（替代固定 CatHours）。窗口可跨午夜：end<start 表示
+	// 时长 = (end-start+1440)%1440（例 23:00~02:00 → 180 分钟）。夜猫硬窗口 23:00-08:00
+	// 仍由脚本侧 within_night_window 把关，随机时刻须落其内才领奖。
+	CatRandomEnabled  bool
+	CatRandomStartMin int
+	CatRandomEndMin   int
+	CatRandomCount    int
 }
 
 // Scheduler 调度器。
@@ -70,9 +91,22 @@ type Scheduler struct {
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
+
+	// 随机每日窗口运行时状态（randomEnabled 时生效）
+	randomEnabled  bool
+	randomStartMin int
+	randomEndMin   int
+	randomFireAt   time.Time // 下一次随机触发时刻；保持 future 直到真正触发
+	randomLastDay  string    // 已计划/已触发的 CST 自然日，保证每天至多一次
+
+	// 开学季随机时点运行时状态（SchoolRandomEnabled 时生效）
+	schoolRandomFireAt time.Time // 当日已规划的随机触发时刻；保持 future 直到触发
+	// 夜猫子随机时点运行时状态（CatRandomEnabled 时生效）
+	catSlots   []time.Time // 当日已生成的随机时刻（升序，过点项在 nextWake 中剔除）
+	catPlanDay string      // 已规划时点的 CST 自然日（窗口归属夜），保证每天至多一轮
 }
 
-// New 构建。
+// New 构建.
 func New(cfg Config) *Scheduler {
 	if len(cfg.CheckinHours) == 0 {
 		cfg.CheckinHours = []int{9, 21}
@@ -96,7 +130,19 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
-	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string)}
+	return &Scheduler{
+		cfg:            cfg,
+		adoptTried:     make(map[string]string),
+		rewardClaimed:  make(map[string]string),
+		randomEnabled:  cfg.RandomWindowEnabled && cfg.RandomWindowEndMin > cfg.RandomWindowStartMin,
+		randomStartMin: cfg.RandomWindowStartMin,
+		randomEndMin:   cfg.RandomWindowEndMin,
+		// 开学季/夜猫子随机时点运行时状态零值即可（nil 切片 / 零时刻），
+		// 由各自 slot 函数在首次 nextWake 时按需规划。
+		schoolRandomFireAt: time.Time{},
+		catSlots:           nil,
+		catPlanDay:         "",
+	}
 }
 
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
@@ -150,6 +196,7 @@ const (
 	taskKeepalive
 	taskSchool
 	taskCat
+	taskRandom
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -161,23 +208,40 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 		kind taskKind
 	}
 	var slots []slot
-	if !s.cfg.CheckinDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
-	}
-	if !s.cfg.TravelDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
-	}
-	if !s.cfg.ActivityDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskActivity})
-	}
-	if !s.cfg.KeepaliveDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
+	if s.randomEnabled {
+		// 随机窗口：四类维护任务合并为每天一次、窗口内随机时刻触发，忽略各自固定小时
+		slots = append(slots, slot{s.nextRandomFire(now), taskRandom})
+	} else {
+		if !s.cfg.CheckinDisabled {
+			slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
+		}
+		if !s.cfg.TravelDisabled {
+			slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
+		}
+		if !s.cfg.ActivityDisabled {
+			slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskActivity})
+		}
+		if !s.cfg.KeepaliveDisabled {
+			slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
+		}
 	}
 	if !s.cfg.SchoolDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours), taskSchool})
+		var schoolAt time.Time
+		if s.cfg.SchoolRandomEnabled {
+			schoolAt = s.schoolSlot(now)
+		} else {
+			schoolAt = nextFire(now, s.cfg.SchoolHours)
+		}
+		slots = append(slots, slot{schoolAt, taskSchool})
 	}
 	if !s.cfg.CatDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
+		var catAt time.Time
+		if s.cfg.CatRandomEnabled {
+			catAt = s.catSlot(now)
+		} else {
+			catAt = nextFire(now, s.cfg.CatHours)
+		}
+		slots = append(slots, slot{catAt, taskCat})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -221,6 +285,136 @@ func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
 	}
 	log.Printf("wakeup grace %s: late catch-up for slot %s", wakeupGraceDelay, planned.Format("15:04"))
 	return sleepCtx(ctx, wakeupGraceDelay)
+}
+
+// nextRandomFire 返回 now 之后最近一次随机窗口触发时刻（每天一次）。
+// randomFireAt 一旦设定就保持 future，直到真正触发；触发后（时刻已过）重新规划为下一天。
+func (s *Scheduler) nextRandomFire(now time.Time) time.Time {
+	if !s.randomFireAt.IsZero() && s.randomFireAt.After(now) {
+		return s.randomFireAt
+	}
+	s.randomFireAt = s.pickRandomOccurrence(now)
+	return s.randomFireAt
+}
+
+// pickRandomOccurrence 规划下一次随机触发：今天窗口未过则取今日随机时刻，否则取明日；
+// 用 randomLastDay 保证同一 CST 自然日至多触发一次（不会同日连发）。
+func (s *Scheduler) pickRandomOccurrence(now time.Time) time.Time {
+	today := travelDay(now)
+	target := today
+	if s.randomLastDay == today {
+		target = travelDay(now.Add(24 * time.Hour)) // 今天已触发过 → 下次是明天
+	}
+	cand := s.randomInWindow(target)
+	if !cand.After(now) {
+		// 极端：target=今天但时刻已过去（刚过窗口边界），顺延明天
+		cand = s.randomInWindow(travelDay(now.Add(24 * time.Hour)))
+		target = travelDay(cand)
+	}
+	s.randomLastDay = target
+	return cand
+}
+
+// randomInWindow 返回指定 CST 自然日 [start,end] 分钟区间内的随机整分时刻。
+func (s *Scheduler) randomInWindow(day string) time.Time {
+	t, _ := time.ParseInLocation("2006-01-02", day, cstZone)
+	span := s.randomEndMin - s.randomStartMin
+	offset := s.randomStartMin + rand.Intn(span+1)
+	return time.Date(t.Year(), t.Month(), t.Day(), offset/60, offset%60, 0, 0, cstZone)
+}
+
+// --------------------------------------------------------------------------
+// 开学季 / 夜猫子 随机时点（替代固定 *_Hours）
+// --------------------------------------------------------------------------
+
+// schoolSlot 返回 now 之后最近一次开学季随机触发时刻（每天一次，窗内随机整分）。
+func (s *Scheduler) schoolSlot(now time.Time) time.Time {
+	if !s.schoolRandomFireAt.IsZero() && s.schoolRandomFireAt.After(now) {
+		return s.schoolRandomFireAt
+	}
+	s.schoolRandomFireAt = s.pickSchoolOccurrence(now)
+	return s.schoolRandomFireAt
+}
+
+// pickSchoolOccurrence 规划开学季随机时刻：今日窗内未过则取今日随机整分，否则取明日。
+func (s *Scheduler) pickSchoolOccurrence(now time.Time) time.Time {
+	today := travelDay(now)
+	cand := randomInRangeDay(today, s.cfg.SchoolRandomStartMin, s.cfg.SchoolRandomEndMin)
+	if !cand.After(now) {
+		cand = randomInRangeDay(travelDay(now.Add(24*time.Hour)), s.cfg.SchoolRandomStartMin, s.cfg.SchoolRandomEndMin)
+	}
+	return cand
+}
+
+// randomInRangeDay 返回指定 CST 自然日 [startMin,endMin] 分钟区间内的随机整分时刻。
+// 用于不跨午夜的窗口（startMin<endMin）。
+func randomInRangeDay(day string, startMin, endMin int) time.Time {
+	t, _ := time.ParseInLocation("2006-01-02", day, cstZone)
+	span := endMin - startMin
+	offset := startMin + rand.Intn(span+1)
+	return time.Date(t.Year(), t.Month(), t.Day(), offset/60, offset%60, 0, 0, cstZone)
+}
+
+// catSlot 返回 now 之后最近一次夜猫子随机触发时刻（每天 CatRandomCount 次，窗内随机）。
+// 维护 catSlots 升序队列：每次取最早未来时刻，过点后在 nextWake 中剔除；全部耗尽/过期后
+// 推进 catPlanDay 重新生成本轮窗口的 CatRandomCount 个时刻。
+func (s *Scheduler) catSlot(now time.Time) time.Time {
+	s.ensureCatPlan(now)
+	if len(s.catSlots) == 0 {
+		return time.Time{}
+	}
+	return s.catSlots[0]
+}
+
+// ensureCatPlan 保证 catSlots 含至少一个未来时刻：剔除过点项，空则按当前夜窗口重生一轮。
+func (s *Scheduler) ensureCatPlan(now time.Time) {
+	for len(s.catSlots) > 0 && !s.catSlots[0].After(now) {
+		s.catSlots = s.catSlots[1:]
+	}
+	if len(s.catSlots) > 0 {
+		return
+	}
+	// 选窗口归属日：若今日夜窗口（CatRandomStartMin 起、长 span）整体已过点，则顺延明日。
+	anchorDay := travelDay(now)
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(),
+		s.cfg.CatRandomStartMin/60, s.cfg.CatRandomStartMin%60, 0, 0, cstZone)
+	span := (s.cfg.CatRandomEndMin - s.cfg.CatRandomStartMin + 1440) % 1440
+	winEnd := todayStart.Add(time.Duration(span) * time.Minute)
+	if winEnd.Before(now) {
+		anchorDay = travelDay(now.Add(24 * time.Hour))
+	}
+	s.catPlanDay = anchorDay
+	s.catSlots = s.pickCatOccurrences(anchorDay)
+	// 重生后仍可能含过点项（恰在边界），再剔一次。
+	for len(s.catSlots) > 0 && !s.catSlots[0].After(now) {
+		s.catSlots = s.catSlots[1:]
+	}
+}
+
+// pickCatOccurrences 生成 anchorDay 所属夜窗口内的 CatRandomCount 个随机时刻（升序、去重）。
+// 窗口可跨午夜：起点 = anchorDay 的 CatRandomStartMin，长 span=(end-start+1440)%1440，
+// offset 0..span 加到起点，time.Date 自动跨日归一化（23:00+180min → 次日 02:00）。
+func (s *Scheduler) pickCatOccurrences(anchorDay string) []time.Time {
+	t, _ := time.ParseInLocation("2006-01-02", anchorDay, cstZone)
+	start := time.Date(t.Year(), t.Month(), t.Day(),
+		s.cfg.CatRandomStartMin/60, s.cfg.CatRandomStartMin%60, 0, 0, cstZone)
+	span := (s.cfg.CatRandomEndMin - s.cfg.CatRandomStartMin + 1440) % 1440
+	if span <= 0 {
+		span = 1
+	}
+	seen := make(map[time.Time]bool)
+	out := make([]time.Time, 0, s.cfg.CatRandomCount)
+	for len(out) < s.cfg.CatRandomCount {
+		off := rand.Intn(span + 1)
+		cand := start.Add(time.Duration(off) * time.Minute)
+		if seen[cand] {
+			continue
+		}
+		seen[cand] = true
+		out = append(out, cand)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+	return out
 }
 
 // Run 主循环，阻塞直到 ctx 取消。
@@ -285,6 +479,12 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 		s.RunSchoolNow()
 	case taskCat:
 		s.RunCatNow()
+	case taskRandom:
+		// 随机窗口触发：签到(刷新+解冻) → 旅行 → 活跃上报 → 保活，合并为一趟
+		s.RunCheckinNow()
+		s.runTravel(ctx)
+		s.runActivity(ctx)
+		s.RunKeepaliveNow()
 	}
 }
 
