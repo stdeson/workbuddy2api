@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -29,6 +30,21 @@ func modelJSONPath(stateFile string) string {
 		return ""
 	}
 	return filepath.Join(filepath.Dir(stateFile), "model.json")
+}
+
+// parseWindowMin 解析 "HH:MM" 为距零点的分钟数；非法返回 (0,false)。
+func parseWindowMin(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	var h, m int
+	if _, err := fmt.Sscanf(s, "%d:%d", &h, &m); err != nil {
+		return 0, false
+	}
+	if h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
 }
 
 func main() {
@@ -144,23 +160,83 @@ func main() {
 	up.BillingBaseGlobal = cfg.Global.BillingBase
 	up.GlobalEnabled = cfg.Global.Enabled
 
+	// 随机每日窗口：启用后四类每日维护任务合并每天一次、窗口内随机时刻触发（防检测）。
+	rwEnabled := false
+	rwStart, rwEnd := 0, 0
+	if cfg.Schedule.RandomWindowEnabled {
+		sm, ok1 := parseWindowMin(cfg.Schedule.RandomWindowStart)
+		em, ok2 := parseWindowMin(cfg.Schedule.RandomWindowEnd)
+		if ok1 && ok2 && sm < em {
+			rwEnabled, rwStart, rwEnd = true, sm, em
+			log.Printf("随机每日窗口已启用：签到/旅行/活跃上报/保活 合并每天一次，随机时刻 %02d:%02d~%02d:%02d",
+				rwStart/60, rwStart%60, rwEnd/60, rwEnd%60)
+		} else {
+			log.Printf("WARN: random_window 配置无效（需 HH:MM 且 start<end），随机窗口未启用，回退固定小时")
+		}
+	}
+
+	// 开学季随机时点：启用后每天在 [start,end] 随机整分触发一次（替代固定 school_hours）。
+	schoolREnabled := false
+	schoolRS, schoolRE := 0, 0
+	if cfg.Schedule.SchoolRandomEnabled {
+		sm, ok1 := parseWindowMin(cfg.Schedule.SchoolRandomStart)
+		em, ok2 := parseWindowMin(cfg.Schedule.SchoolRandomEnd)
+		if ok1 && ok2 && sm < em {
+			schoolREnabled, schoolRS, schoolRE = true, sm, em
+			log.Printf("开学季随机时点已启用：每天一次，随机时刻 %02d:%02d~%02d:%02d",
+				schoolRS/60, schoolRS%60, schoolRE/60, schoolRE%60)
+		} else {
+			log.Printf("WARN: school_random 配置无效（需 HH:MM 且 start<end），开学季回退固定小时 %v", cfg.Schedule.SchoolHours)
+		}
+	}
+
+	// 夜猫子随机时点：启用后每天在可跨午夜窗口 [start,end] 随机生成 count 次触发（替代固定 cat_hours）。
+	// 允许 end<start（跨日，例 23:00~02:00）；窗口须包在夜猫硬窗口 23:00-08:00 内才能领奖。
+	catREnabled := false
+	catRS, catRE, catRC := 0, 0, 0
+	if cfg.Schedule.CatRandomEnabled {
+		sm, ok1 := parseWindowMin(cfg.Schedule.CatRandomStart)
+		em, ok2 := parseWindowMin(cfg.Schedule.CatRandomEnd)
+		if ok1 && ok2 {
+			catRC = cfg.Schedule.CatRandomCount
+			if catRC <= 0 {
+				catRC = 3
+			}
+			catREnabled, catRS, catRE = true, sm, em
+			log.Printf("夜猫子随机时点已启用：每天 %d 次，窗口 %02d:%02d~%02d:%02d（可跨午夜）",
+				catRC, catRS/60, catRS%60, catRE/60, catRE%60)
+		} else {
+			log.Printf("WARN: cat_random 配置无效（需 HH:MM），夜猫子回退固定小时 %v", cfg.Schedule.CatHours)
+		}
+	}
+
 	sch := scheduler.New(scheduler.Config{
-		Pool:                p,
-		Upstream:            up,
-		CheckinHours:        cfg.Schedule.CheckinHours,
-		TravelHours:         cfg.Schedule.TravelHours,
-		ActivityHours:       cfg.Schedule.ActivityHours,
-		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
-		SchoolHours:         cfg.Schedule.SchoolHours,
-		CatHours:            cfg.Schedule.CatHours,
-		ActivityReportCount: cfg.Schedule.ActivityReportCount,
-		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
-		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:      !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
-		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
-		CatDisabled:         !cfg.Schedule.CatEnabled,
+		Pool:                 p,
+		Upstream:             up,
+		CheckinHours:         cfg.Schedule.CheckinHours,
+		TravelHours:          cfg.Schedule.TravelHours,
+		ActivityHours:        cfg.Schedule.ActivityHours,
+		KeepaliveHours:       cfg.Schedule.KeepaliveHours,
+		SchoolHours:          cfg.Schedule.SchoolHours,
+		CatHours:             cfg.Schedule.CatHours,
+		ActivityReportCount:  cfg.Schedule.ActivityReportCount,
+		ExpiringSoonWindow:   cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
+		CheckinDisabled:      !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:       !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:     !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:    !cfg.Schedule.KeepaliveEnabled,
+		SchoolDisabled:       !cfg.Schedule.SchoolEnabled,
+		CatDisabled:          !cfg.Schedule.CatEnabled,
+		RandomWindowEnabled:  rwEnabled,
+		RandomWindowStartMin: rwStart,
+		RandomWindowEndMin:   rwEnd,
+		SchoolRandomEnabled:  schoolREnabled,
+		SchoolRandomStartMin: schoolRS,
+		SchoolRandomEndMin:   schoolRE,
+		CatRandomEnabled:     catREnabled,
+		CatRandomStartMin:    catRS,
+		CatRandomEndMin:      catRE,
+		CatRandomCount:       catRC,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -187,11 +263,17 @@ func main() {
 	}
 	if !cfg.Schedule.SchoolEnabled {
 		log.Printf("开学季任务已禁用（schedule.school_enabled=false）")
+	} else if schoolREnabled {
+		log.Printf("开学季任务已启用：每天随机一次 %02d:%02d~%02d:%02d（school_open_day_2026.py ALL --run --yes）",
+			schoolRS/60, schoolRS%60, schoolRE/60, schoolRE%60)
 	} else {
 		log.Printf("开学季任务已启用：%v 点（school_open_day_2026.py ALL --run --yes）", cfg.Schedule.SchoolHours)
 	}
 	if !cfg.Schedule.CatEnabled {
 		log.Printf("夜猫子任务已禁用（schedule.cat_enabled=false）")
+	} else if catREnabled {
+		log.Printf("夜猫子任务已启用：每天随机 %d 次 %02d:%02d~%02d:%02d（task_runner.py ALL --yes --only black_cat）",
+			catRC, catRS/60, catRS%60, catRE/60, catRE%60)
 	} else {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
