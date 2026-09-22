@@ -40,6 +40,31 @@ type Schedule struct {
 	ActivityReportCount int `json:"activity_report_count"`
 	// 猫猫旅行已退役 travel_interval_minutes：旅行现为独立排程（travel_hours）。
 	// 旧 config 里的该键因 JSON 未知字段而自然忽略，不报错。
+
+	// RandomWindow 随机每日窗口：启用后，签到/旅行/活跃上报/token 保活 四类每日维护任务
+	// 合并为每天一次，在 [Start,End] 之间的随机整分时刻触发（防账号行为规律被检测）。
+	// 启用时忽略上面四类的 *_Hours 固定整点排程；开学季/夜猫子仍走各自固定小时。
+	// start/end 格式 "HH:MM"（本地 CST），需满足 00:00<=start<end<=23:59。
+	RandomWindowEnabled bool   `json:"random_window_enabled"`
+	RandomWindowStart   string `json:"random_window_start"` // 例 "08:33"
+	RandomWindowEnd     string `json:"random_window_end"`   // 例 "23:25"
+
+	// 开学季随机时点：启用后开学季任务每天在 [SchoolRandomStart,SchoolRandomEnd] 随机整分
+	// 触发一次（替代固定 school_hours）。窗内不跨午夜，需满足 start<end。
+	// 缺省窗口 08:00~11:00（用户要求：避开核心随机窗口 08:33 起点，落在上午）。
+	SchoolRandomEnabled bool   `json:"school_random_enabled"`
+	SchoolRandomStart   string `json:"school_random_start"` // 缺省 "08:00"
+	SchoolRandomEnd     string `json:"school_random_end"`   // 缺省 "11:00"
+	// 夜猫子随机时点：启用后夜猫子任务每天在 [CatRandomStart,CatRandomEnd] 窗口内随机生成
+	// CatRandomCount 个时刻触发（替代固定 cat_hours）。窗口允许跨午夜（如 23:00~02:00：
+	// end<start 表示跨日，时长 = (end-start+1440)%1440）。夜猫窗口 23:00-08:00 硬约束仍在，
+	// 随机时刻必须落在该窗口内才能领奖，故 CatRandomStart/End 应包在 23:00~08:00 中。
+	// 缺省 23:00~02:00、每天 3 次（用户要求：分散触发降检测，但服务端每窗口至多补 1 次，
+	// 故仅首个随机时刻真正领奖，其余为幂等 no-op）。
+	CatRandomEnabled bool   `json:"cat_random_enabled"`
+	CatRandomStart   string `json:"cat_random_start"` // 缺省 "23:00"
+	CatRandomEnd     string `json:"cat_random_end"`   // 缺省 "02:00"
+	CatRandomCount   int    `json:"cat_random_count"` // 缺省 3；<=0 归一为 3
 }
 
 // DefaultSchedule 返回排程段的默认值。
@@ -52,9 +77,9 @@ func DefaultSchedule() Schedule {
 		CheckinHours:        []int{9, 21},
 		TravelHours:         []int{9, 21},
 		ActivityHours:       []int{10},
-		KeepaliveHours:       []int{22},
-		SchoolHours:          []int{12},
-		CatHours:             []int{1},
+		KeepaliveHours:      []int{22},
+		SchoolHours:         []int{12},
+		CatHours:            []int{1},
 		CheckinEnabled:      true,
 		TravelEnabled:       true,
 		ActivityEnabled:     true,
@@ -62,6 +87,14 @@ func DefaultSchedule() Schedule {
 		SchoolEnabled:       true,
 		CatEnabled:          true,
 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
+		// 开学季/夜猫子随机时点缺省关闭（回落固定小时），由 config 显式开启。
+		SchoolRandomEnabled: false,
+		SchoolRandomStart:   "08:00",
+		SchoolRandomEnd:     "11:00",
+		CatRandomEnabled:    false,
+		CatRandomStart:      "23:00",
+		CatRandomEnd:        "02:00",
+		CatRandomCount:      3,
 	}
 }
 
@@ -95,6 +128,10 @@ func (s *Schedule) Normalize() error {
 	// 0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if s.ActivityReportCount <= 0 {
 		s.ActivityReportCount = 1
+	}
+	// 夜猫子随机次数：<=0 归一为 3（缺省每天 3 次）。
+	if s.CatRandomCount <= 0 {
+		s.CatRandomCount = 3
 	}
 	return s.validateHours()
 }
