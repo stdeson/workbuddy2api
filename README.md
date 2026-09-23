@@ -78,6 +78,29 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 - **会话头族注入** — 出站携带官方客户端会话头族（`X-Conversation-Request-ID` 聚合主键 · `X-Conversation-ID` 透传 · B3 链路），轮转 / 重试 / 路径回退复用同键，后台按对话轮聚合不再碎片化（issue #35）
 - **指纹脱敏** — 出站请求体黑名单指纹字段清洗（可开关），与提示词体系两层叠加
 
+### 搜索适配端点（DSH `web_search`）
+
+`POST /agenttool/v1/messages` 把 DSH 的联网搜索请求转成一次上游 `/agenttool/v1/search` 直查：
+抠出查询词 → 复用号池出站 → 拼成消费方要的 `web_search_tool_result` 块。**不跑模型、零 token、
+约 2 秒**——相比之下官方 DeepSeek 搜索后端每次消耗一轮完整模型调用。
+
+- **为什么长这样** — DSH 的搜索提供方只会说 Anthropic Messages，且**只取**响应里的结构化结果块
+  （提供方文本一律丢弃）。所以这里既不是通用 Anthropic API、也不需要实现 Messages 协议，只是搜索适配器；
+  路径挂在 `/agenttool` 下而非 `/anthropic`，就是不冒充通用协议实现
+- **搜索不惩罚账号** — 次级只读功能，失败（尤其路径级 404、IP 级 429）不写池状态：不冷却、不禁用、
+  不喂熔断。否则上游一次抖动就能把 chat 也一起拖下水；账号健康由 chat 链路裁决
+- **仅 CN 域账号参与** — `/agenttool/v1/search` 实测在 `copilot.tencent.com`；global 域是否同构未验证
+- **`publishedAt` 为空** — 上游结果不含发布日期字段（只有 title/url/snippet/site/score/content/highlights），
+  编造日期比缺失更糟，故 `page_age` 一律留空
+
+消费方（DSH）侧配置：`~/.dsh/settings.yaml` 加一段即可，改完按次生效、无需重启。
+
+```yaml
+web-search-deepseek:
+  baseURL: https://<网关域名>/agenttool/v1   # DSH 会自行追加 /messages
+  apiKeyEnv: CODEBUDDY_API_KEY               # 填网关的 api_key（默认值是官方 DEEPSEEK_API_KEY，指过来会 401）
+```
+
 ### 选号语义
 
 选号 = 会话粘性（命中即定）→ 成本分层（硬过滤）→ 加权随机（软均衡）三层串联，各层语义：
@@ -130,6 +153,7 @@ flowchart LR
     P -. "状态镜像" .-> REDIS[("Upstash Redis\n可选")]
     U -->|"chat/completions (SSE)"| CB["CodeBuddy\ncopilot.tencent.com"]
     U -->|"billing / auth / growth"| CB
+    U -->|"agenttool/v1/search (DSH web_search)"| CB
 ```
 
 上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、`image_url` 字符串兼容为 OpenAI 对象形态、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
@@ -253,6 +277,12 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+# 搜索适配端点（DSH web_search 的后端）：抠出前缀后的查询词，直查上游搜索
+curl -s -X POST http://localhost:7863/agenttool/v1/messages \
+  -H "Authorization: Bearer your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":[{"type":"text","text":"Perform a web search for the query: DeepSeek V4"}]}]}'
 ```
 
 ## 安全与合规

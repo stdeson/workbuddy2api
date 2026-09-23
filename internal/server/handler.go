@@ -107,6 +107,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
+	// DSH 搜索适配端点（见 handler_anthropic.go）：不是通用 Anthropic API，只是把
+	// DSH 的 web_search 请求转成一次上游 /agenttool/v1/search 检索。
+	h.mux.HandleFunc("POST "+anthropicSearchPath, h.withAuth(h.anthropicMessages))
 	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
 	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
 	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权
