@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,16 +18,21 @@ type fakeScriptExec struct {
 	lastName string
 	lastArgs []string
 	lastDir  string
+	output   io.Writer
 	runN     int
 	err      error
 }
 
-func (f *fakeScriptExec) SetDir(dir string) { f.lastDir = dir }
-func (f *fakeScriptExec) Run() error        { f.runN++; return f.err }
+func (f *fakeScriptExec) SetDir(dir string)     { f.lastDir = dir }
+func (f *fakeScriptExec) SetOutput(w io.Writer) { f.output = w }
+func (f *fakeScriptExec) Run() error            { f.runN++; return f.err }
 
 // installFakeExec 替换 newScriptCmd，测试结束还原。
+// 同时把脚本日志目录指向 t.TempDir()：runScript 会真实打开 <repoRoot>/data/logs/*.log，
+// 不隔离就会往工作树里写日志文件（并让"唯一日志文件"类断言互相污染）。
 func installFakeExec(t *testing.T) *fakeScriptExec {
 	t.Helper()
+	t.Setenv("WB2A_SCRIPT_LOG_DIR", t.TempDir())
 	f := &fakeScriptExec{}
 	orig := newScriptCmd
 	newScriptCmd = func(name string, args ...string) scriptRunner {
@@ -199,5 +205,137 @@ func TestPythonCmd(t *testing.T) {
 	t.Setenv("WB2A_PYTHON", "  /usr/bin/python3.10  ")
 	if got := pythonCmd(); got != "/usr/bin/python3.10" {
 		t.Errorf("trim pythonCmd()=%q want /usr/bin/python3.10", got)
+	}
+}
+
+// TestScriptLogDir WB2A_SCRIPT_LOG_DIR 覆盖脚本日志目录；缺省/空白回落
+// <repoRoot>/data/logs（容器内 = 宿主 data 卷，容器重建不丢）。
+func TestScriptLogDir(t *testing.T) {
+	root := repoRoot()
+	want := filepath.Join(root, "data", "logs")
+
+	t.Setenv("WB2A_SCRIPT_LOG_DIR", "")
+	if got := scriptLogDir(root); got != want {
+		t.Errorf("default scriptLogDir=%q want %q", got, want)
+	}
+
+	t.Setenv("WB2A_SCRIPT_LOG_DIR", "   ")
+	if got := scriptLogDir(root); got != want {
+		t.Errorf("blank scriptLogDir=%q want %q", got, want)
+	}
+
+	dir := t.TempDir()
+	t.Setenv("WB2A_SCRIPT_LOG_DIR", "  "+dir+"  ")
+	if got := scriptLogDir(root); got != dir {
+		t.Errorf("override scriptLogDir=%q want %q（应 trim）", got, dir)
+	}
+}
+
+// TestRunCatNowWritesScriptLog 夜猫子任务把脚本输出落盘到
+// <WB2A_SCRIPT_LOG_DIR>/cat-YYYYMMDD.log：命令头 + 结果行 + 子进程接到了 writer。
+// 脚本 print 是每号结果的唯一来源，进程日志那行 ok/WARN 不足以对账。
+func TestRunCatNowWritesScriptLog(t *testing.T) {
+	t.Setenv("WB2A_PYTHON", "")
+	f := installFakeExec(t) // 已把日志目录隔离到 t.TempDir()
+	s := New(Config{})
+	s.RunCatNow()
+
+	dir := os.Getenv("WB2A_SCRIPT_LOG_DIR")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read log dir %q: %v", dir, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("log dir %q 应有 1 个日志文件，实际 %d 个", dir, len(entries))
+	}
+	if want := "cat-" + time.Now().Format("20060102") + ".log"; entries[0].Name() != want {
+		t.Errorf("日志文件名=%q want %q", entries[0].Name(), want)
+	}
+	if f.output == nil {
+		t.Errorf("脚本子进程未接日志 writer（SetOutput 未被调用）")
+	}
+
+	b, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	for _, want := range []string{
+		"dir=" + repoRoot(),
+		"python3 scripts/task_runner.py ALL --yes --only black_cat",
+		"cat: ok",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("脚本日志缺少 %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunScriptFailureWritesScriptLog 脚本失败时日志同样落盘（FAILED 结果行），
+// 且进程日志的 WARN 行带上日志路径——否则失败原因只剩一个退出码。
+func TestRunScriptFailureWritesScriptLog(t *testing.T) {
+	f := installFakeExec(t)
+	f.err = errors.New("boom boom")
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(log.LstdFlags)
+	})
+
+	runScript("cat", repoRoot(), [][]string{
+		{"python3", "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"},
+	})
+
+	out := buf.String()
+	if !strings.Contains(out, "WARN") || !strings.Contains(out, "(log: ") {
+		t.Errorf("失败 WARN 行应带日志路径:\n%s", out)
+	}
+	dir := os.Getenv("WB2A_SCRIPT_LOG_DIR")
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("log dir %q entries=%v err=%v want 1 file", dir, entries, err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "FAILED: boom boom") {
+		t.Errorf("日志缺少失败结果行:\n%s", string(b))
+	}
+}
+
+// TestRunOneScriptLogUnwritable 日志目录不可建时不影响脚本任务本身：
+// 只留一行 WARN，命令照常执行（可观测性增强不得阻断业务）。
+func TestRunOneScriptLogUnwritable(t *testing.T) {
+	f := installFakeExec(t)
+	// 指向一个"父路径是普通文件"的位置：MkdirAll 必然失败。
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WB2A_SCRIPT_LOG_DIR", filepath.Join(blocker, "logs"))
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(log.LstdFlags)
+	})
+
+	runScript("cat", repoRoot(), [][]string{{"python3", "scripts/task_runner.py"}})
+
+	if f.runN != 1 {
+		t.Errorf("日志不可写时脚本仍应执行: runN=%d want 1", f.runN)
+	}
+	if f.output != nil {
+		t.Errorf("日志打开失败时不应设置 writer")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "WARN") || !strings.Contains(out, "cat: ok") {
+		t.Errorf("应同时有目录 WARN 与结果行:\n%s", out)
 	}
 }

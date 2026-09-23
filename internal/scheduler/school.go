@@ -7,11 +7,14 @@
 package scheduler
 
 import (
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // repoRoot 定位仓库根（容器内 /app、宿主 /root/workbuddy2api）。
@@ -41,6 +44,8 @@ func repoRoot() string {
 // scriptRunner 脚本子进程的最小执行面：可被测试替换，避免测试真正拉起 python3。
 type scriptRunner interface {
 	SetDir(string)
+	// SetOutput 指定脚本 stdout/stderr 的落盘目标；nil 表示丢弃（等同改动前行为）。
+	SetOutput(io.Writer)
 	Run() error
 }
 
@@ -49,7 +54,15 @@ type scriptRunner interface {
 type scriptCmd struct{ cmd *exec.Cmd }
 
 func (c *scriptCmd) SetDir(dir string) { c.cmd.Dir = dir }
-func (c *scriptCmd) Run() error        { return c.cmd.Run() }
+
+// SetOutput 把子进程的 stdout/stderr 指向日志文件：exec 直接把 fd 交给子进程，
+// 日志文件以 O_APPEND 打开，多路写入的追加语义由内核保证。
+func (c *scriptCmd) SetOutput(w io.Writer) {
+	c.cmd.Stdout = w
+	c.cmd.Stderr = w
+}
+
+func (c *scriptCmd) Run() error { return c.cmd.Run() }
 
 // newScriptCmd 构建脚本子进程。包级变量便于测试注入 fake（installFakeExec 覆盖）。
 // 工作目录由调用方 SetDir 显式设置仓库根。
@@ -74,17 +87,87 @@ func pythonCmd() string {
 	return "python3"
 }
 
+// scriptLogDir 返回脚本输出的落地目录。
+//
+// 默认 <repoRoot>/data/logs：容器内 /app/data 已 bind-mount 到宿主
+// /root/code/workbuddy2api/data（见 docker-compose.yml），容器重建不丢日志；
+// 且该路径不在版本库里（*.log 也被 .gitignore 覆盖），不会污染工作树。
+// WB2A_SCRIPT_LOG_DIR 显式指定时优先（测试指向 t.TempDir()，不往仓库写）。
+func scriptLogDir(root string) string {
+	if v := strings.TrimSpace(os.Getenv("WB2A_SCRIPT_LOG_DIR")); v != "" {
+		return v
+	}
+	return filepath.Join(root, "data", "logs")
+}
+
+// scriptLogPath 返回当天日志文件路径 <dir>/<name>-YYYYMMDD.log（本地时区，追加写）。
+// 按天分文件：cat 每天 3 次、school 每天 1 次，单文件不会无限膨胀。
+func scriptLogPath(name, root string) string {
+	return filepath.Join(scriptLogDir(root), name+"-"+time.Now().Format("20060102")+".log")
+}
+
+// openScriptLog 以追加方式打开当天日志；失败返回 nil 并留一行 WARN——
+// 日志落盘属于可观测性增强，绝不能因为目录不可写而阻断脚本任务本身。
+func openScriptLog(name, root string) *os.File {
+	path := scriptLogPath(name, root)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		log.Printf("WARN: script log dir %s: %v", filepath.Dir(path), err)
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		log.Printf("WARN: script log %s: %v", path, err)
+		return nil
+	}
+	return f
+}
+
+// logHint 返回进程日志尾部的日志文件路径提示；未落盘时为空串。
+func logHint(name, root string, f *os.File) string {
+	if f == nil {
+		return ""
+	}
+	return " (log: " + scriptLogPath(name, root) + ")"
+}
+
 // runScript 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
 // 不影响调度主循环继续跑下一个时点。单命令失败不中断后续命令。
 func runScript(name, root string, commands [][]string) {
 	for _, cmdArgs := range commands {
-		c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
-		c.SetDir(root)
-		if err := c.Run(); err != nil {
-			log.Printf("WARN: %s (%s): %v", name, cmdArgs[1], err)
-			continue
+		runOneScript(name, root, cmdArgs)
+	}
+}
+
+// runOneScript 执行单条脚本命令，并把该命令的 stdout/stderr 追加落盘到
+// <repoRoot>/data/logs/<name>-YYYYMMDD.log，文件里另写首尾两行（开始时间+命令 /
+// 结束时间+结果）。
+//
+// 这样做的原因：脚本自身的 print 是"每号任务结果"的唯一来源（哪一号领到、
+// 哪一号因能量不足没点亮），而进程日志只留一行 ok/WARN——只凭退出码无法对账，
+// 出问题也没法回溯。日志写不进去时不改变任务行为（见 openScriptLog）。
+func runOneScript(name, root string, cmdArgs []string) {
+	c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
+	c.SetDir(root)
+
+	f := openScriptLog(name, root)
+	if f != nil {
+		defer f.Close()
+		c.SetOutput(f)
+		fmt.Fprintf(f, "\n===== %s | %s | dir=%s =====\n",
+			time.Now().Format(time.RFC3339), strings.Join(cmdArgs, " "), root)
+	}
+
+	if err := c.Run(); err != nil {
+		log.Printf("WARN: %s (%s): %v%s", name, cmdArgs[1], err, logHint(name, root, f))
+		if f != nil {
+			fmt.Fprintf(f, "===== %s | %s: FAILED: %v =====\n",
+				time.Now().Format(time.RFC3339), name, err)
 		}
-		log.Printf("%s: ok (%s)", name, cmdArgs[1])
+		return
+	}
+	log.Printf("%s: ok (%s)%s", name, cmdArgs[1], logHint(name, root, f))
+	if f != nil {
+		fmt.Fprintf(f, "===== %s | %s: ok =====\n", time.Now().Format(time.RFC3339), name)
 	}
 }
 
