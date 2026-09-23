@@ -16,6 +16,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
@@ -51,6 +52,12 @@ type Config struct {
 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
+
+	// Metrics 请求统计收集器（/v1/stats 时间趋势的数据源，可选）。
+	// nil = 未启用（config server.metrics_enabled=false）：/v1/stats 仍返回累计统计，
+	// 但不返回 series_buckets/range，面板「时间趋势」显示"网关未升级/未启用"占位。
+	// 由 main 装配（metrics.New + retention）；测试可直接注入。
+	Metrics *metrics.Collector
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -107,6 +114,13 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
+	// 固定号端点族（/v1/accounts + /v1/quota + /v1/a/{uid}/*）：让上游网关（9Router 等）
+	// 按账号各建一条连接自行轮转，而不是共享一个池化连接与 Pick() 竞速。
+	// 只读（accounts/quota）+ 转发（pinned chat），鉴权与其余端点同源（同一个 api_key）。
+	h.mux.HandleFunc("GET /v1/accounts", h.withAuth(h.accounts))
+	h.mux.HandleFunc("GET /v1/quota", h.withAuth(h.quota))
+	h.mux.HandleFunc("GET /v1/a/{uid}/quota", h.withAuth(h.pinnedQuota))
+	h.mux.HandleFunc("POST /v1/a/{uid}/chat/completions", h.withAuth(h.pinnedChat))
 	// DSH 搜索适配端点（见 handler_anthropic.go）：不是通用 Anthropic API，只是把
 	// DSH 的 web_search 请求转成一次上游 /agenttool/v1/search 检索。
 	h.mux.HandleFunc("POST "+anthropicSearchPath, h.withAuth(h.anthropicMessages))
@@ -504,6 +518,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	if h.cfg.Metrics != nil {
+		// 本次请求同时记入时间序列收集器（/v1/stats 的时间趋势数据源）。
+		st.collector = h.cfg.Metrics
+	}
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -524,8 +542,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if stickyKey == "" {
 		stickyKey = session.StickyFallbackKey(body)
 	}
+	// 固定号端点（POST /v1/a/{uid}/chat/completions）：把路径里的 uid 钉成**选号目标**，
+	// 供上游网关按账号建连后各自轮转（不与共享池的 Pick 竞速）。
+	// pinned 与粘性的区别：不写会话绑定（路径即意图，无会话语义可绑定），失败时只清空
+	// pin 回落普通轮换，不会误改其他人的粘性绑定。
+	pinUID := r.PathValue("uid")
+	pinned := pinUID != ""
 	stickyUID := ""
-	if h.cfg.Session != nil && stickyKey != "" {
+	if pinned {
+		stickyUID = pinUID
+	} else if h.cfg.Session != nil && stickyKey != "" {
 		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
 		// 粘性命中校验走 injected AvailableForModel 闭包 → 闭包内部 resolveModel 剥前缀
 		// 得 realm+bare，再按 realm 过滤可用集合。若传已剥前缀的 bareModel，闭包对裸名
@@ -562,10 +588,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// unbindSticky 解绑当前会话粘性号（stickyUID 非空时）。供「粘性号不可用/被抢」与 fail 共用。
-	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
+	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。
+	// pinned 路径只清空 pin（没有绑定可解），故不碰 Session——否则会用请求体派生的
+	// stickyKey 去解绑一个从未建立过的绑定（乃至误伤会话粘性）。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(stickyKey)
+			if !pinned && h.cfg.Session != nil {
+				h.cfg.Session.Unbind(stickyKey)
+			}
 			stickyUID = ""
 		}
 	}

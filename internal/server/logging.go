@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/metrics"
 )
 
 // chatSeq 进程级请求序号。
@@ -41,6 +42,11 @@ type chatStat struct {
 	cacheWr   int
 	credit    float64
 	hasCredit bool
+
+	// collector 非 nil 时，本请求同时记入时间序列统计（/v1/stats 的 series_buckets/range
+	// 数据源，见 internal/metrics）。由 handler 在构造后从 Config.Metrics 注入；
+	// nil（metrics_enabled=false）= 只做进程内累计统计，不落盘时间序列。
+	collector *metrics.Collector
 
 	logged bool
 }

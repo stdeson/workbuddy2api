@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
@@ -278,6 +279,21 @@ func main() {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
 
+	// 请求统计收集器（/v1/stats「时间趋势」的数据源，server.metrics_enabled 控制）。
+	//
+	// 为什么在网关侧采集：网关是所有流量（含绕过面板的脚本/第三方客户端）的唯一必经点，
+	// 只有这里能统计到完整调用。按小时分桶落盘 data/metrics.json：网关重启不清零，
+	// 但**重新部署/首次启用之前的历史不可回溯**（面板文案已如实说明）。
+	// MetricsFile 为空 = 纯内存（重启清零）。
+	var metricsCollector *metrics.Collector
+	if cfg.Server.MetricsEnabled {
+		metricsCollector = metrics.New(cfg.Server.MetricsFile)
+		metricsCollector.SetRetention(time.Duration(cfg.Server.MetricsRetentionDays) * 24 * time.Hour)
+		log.Printf("请求统计: 已启用（file=%q retention=%dd）", cfg.Server.MetricsFile, cfg.Server.MetricsRetentionDays)
+	} else {
+		log.Printf("请求统计: 已禁用（server.metrics_enabled=false，面板时间趋势不可用）")
+	}
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -292,6 +308,8 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
 		AdminEnabled: cfg.Admin.Enabled,
+		// 请求统计收集器（nil = 未启用：/v1/stats 只回累计统计）。
+		Metrics: metricsCollector,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -314,6 +332,11 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
+		// 统计时间序列同样在退出前补一次落盘：正常路径由 Collector 内部
+		// 每 N 次记录自动落盘，这里只兜住"最后一次写还在内存里"的尾巴。
+		if metricsCollector != nil {
+			metricsCollector.Flush()
+		}
 		// Flush 已把最后一笔状态快照提交给 Redis（fire-and-forget）；store.Close
 		// 等 Upstash 在途/排队写排空再关连接——最后一笔镜像必须写完才退出（发现 4）。
 		// Noop 的 Close 是空操作；单写上限 5s × 上限 8，Close 内部另有超时兜底。

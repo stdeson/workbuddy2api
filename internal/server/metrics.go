@@ -15,8 +15,11 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/metrics"
 )
 
 // metricsCap 模型键容量上限。上游目录规模远小于此值；上限只为兜底异常模型名。
@@ -61,6 +64,10 @@ var globalMetrics = &metricsStore{
 // total 为端到端耗时（TTFB 与生成吞吐的分母口径均由此派生）。模型名为空/"-" 时
 // 归入 "-" 键（仍计入 total，不丢弃观测）。
 func recordChatMetric(s *chatStat, total time.Duration) {
+	// 第二本账：时间序列收集器（/v1/stats 的 series_buckets/range 数据源）。
+	// 放在入口、独立加锁——与下面的累计表两把锁**不嵌套**，杜绝锁序问题。
+	recordSeries(s, total)
+
 	model := s.model
 	if model == "" {
 		model = "-"
@@ -129,6 +136,46 @@ func recordChatMetric(s *chatStat, total time.Duration) {
 	}
 
 	mm.lastSeen = time.Now()
+}
+
+// recordSeries 把一次请求写入时间序列收集器（internal/metrics，即面板「时间趋势」数据源）。
+//
+// 与 recordChatMetric（进程内累计表）口径**逐条对齐**，否则同一页面上"累计"与"趋势"
+// 会对不上账：
+//   - success 只认 200（本文件既有口径，非 2xx 一律计入 failed）；
+//   - toks < 0 是「观测缺失」哨兵，不累加（否则负值把总量越拉越偏）；
+//   - hasUsage=false 时 token/cache 一并不计（缺失≠0）；hasCredit=false 时 credit 不计。
+//
+// collector 为 nil（metrics_enabled=false）时空操作，本函数不产生任何副作用。
+func recordSeries(s *chatStat, total time.Duration) {
+	c := s.collector
+	if c == nil {
+		return
+	}
+	comp := 0
+	if s.toks > 0 {
+		comp = s.toks
+	}
+	d := metrics.Delta{
+		Model:    s.model,
+		Stream:   s.mode == "stream",
+		OK:       s.status == 200,
+		TTFB:     s.ttfb,
+		Latency:  total,
+		HasUsage: s.hasUsage,
+	}
+	if s.hasUsage {
+		d.PromptTokens = int64(s.prompt)
+		d.CompletionTokens = int64(comp)
+		d.TotalTokens = int64(s.prompt + comp)
+		d.CacheHitTokens = int64(s.cacheHit)
+		d.CacheMissTokens = int64(s.cacheMiss)
+		d.CacheWriteTokens = int64(s.cacheWr)
+	}
+	if s.hasCredit {
+		d.Credit = s.credit
+	}
+	c.Record(d)
 }
 
 // MetricsSnapshot 是 /v1/stats 的响应载荷（字段名与社区面板约定一致）。
@@ -347,14 +394,112 @@ func intFromUsage(u map[string]any, key string) int {
 
 // stats 处理 GET /v1/stats：返回按模型聚合的请求统计（社区面板数据源）。
 // 聚合口径不变；出口处只读合入模型目录的积分倍率（enrichCredits，无上游调用）。
+//
+// 时间维度（可选）：?range=today|yesterday|7d|30d|90d|all 或 &from=&to=，
+// 配合 &interval=hour|day|week 与 &model=<name>。装了收集器（Metrics != nil）时
+// 额外返回 series_buckets（可回溯桶数，面板据此提示保留期）与 range（区间序列）。
+// 未装收集器（metrics_enabled=false）时字段缺省，面板显示"未启用"占位——这是
+// 设计好的向后兼容行为，不是错误。
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	snap := MetricsSnapshotOf()
 	h.enrichCredits(&snap)
-	writeJSON(w, http.StatusOK, snap)
+	if h.cfg.Metrics == nil {
+		writeJSON(w, http.StatusOK, snap)
+		return
+	}
+	// 手写 map 而非扩展 MetricsSnapshot：老字段逐字不变（面板其他卡片零回归），
+	// 新字段只在装了收集器时出现。
+	out := map[string]any{
+		"enabled":        snap.Enabled,
+		"since":          snap.Since,
+		"now":            snap.Now,
+		"uptime_sec":     snap.UptimeSec,
+		"total":          snap.Total,
+		"models":         snap.Models,
+		"series_buckets": h.cfg.Metrics.SeriesBuckets(),
+	}
+	if snap.Message != "" {
+		out["message"] = snap.Message
+	}
+	if q, ok := parseRangeQuery(r); ok {
+		out["range"] = h.cfg.Metrics.Range(q)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// parseRangeQuery 解析 /v1/stats 的时间维度参数；无任何时间参数时返回 ok=false
+// （只返回累计统计，不做无谓的区间聚合）。
+//
+// 支持的写法：
+//
+//	?range=today|yesterday|7d|30d|90d|all   相对区间（便捷）
+//	?from=RFC3339&to=RFC3339                绝对区间（精确选择，优先于 range）
+//	?interval=hour|day|week                 聚合粒度（默认 hour）
+//	?model=<name>                           只看单个模型
+//
+// 非法时间被忽略而不是报错：统计是观测功能，宁可按默认区间返回，也不要 400 让面板整页失败。
+func parseRangeQuery(r *http.Request) (metrics.RangeQuery, bool) {
+	q := r.URL.Query()
+	interval := metrics.NormalizeInterval(q.Get("interval"))
+	model := strings.TrimSpace(q.Get("model"))
+
+	var from, to time.Time
+	hasRange := false
+
+	// 绝对区间优先（用户显式选了时间段）。
+	if v := strings.TrimSpace(q.Get("from")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			from = t
+			hasRange = true
+		}
+	}
+	if v := strings.TrimSpace(q.Get("to")); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			to = t
+			hasRange = true
+		}
+	}
+
+	if !hasRange {
+		now := time.Now()
+		switch strings.ToLower(strings.TrimSpace(q.Get("range"))) {
+		case "today":
+			from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+			to = from.AddDate(0, 0, 1)
+			hasRange = true
+		case "yesterday":
+			to = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+			from = to.AddDate(0, 0, -1)
+			hasRange = true
+		case "7d", "week":
+			from = now.AddDate(0, 0, -7)
+			hasRange = true
+		case "30d", "month":
+			from = now.AddDate(0, 0, -30)
+			hasRange = true
+		case "90d":
+			from = now.AddDate(0, 0, -90)
+			hasRange = true
+		case "all":
+			hasRange = true
+		default:
+			// 未指定 range：仅当显式带了 interval/model 才返回时间序列，
+			// 避免面板不传参数时白白计算一遍。
+			hasRange = q.Get("interval") != "" || model != ""
+		}
+	}
+	if !hasRange {
+		return metrics.RangeQuery{}, false
+	}
+	return metrics.RangeQuery{From: from, To: to, Interval: interval, Model: model}, true
 }
 
 // statsReset 处理 POST /v1/stats/reset：清空累计，便于观察增量。
+// 两本账一起清：进程内累计表 + 时间序列（否则清完看趋势仍见旧数据，对不上账）。
 func (h *Handler) statsReset(w http.ResponseWriter, r *http.Request) {
 	ResetMetrics()
+	if h.cfg.Metrics != nil {
+		h.cfg.Metrics.Reset()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

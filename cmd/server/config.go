@@ -20,7 +20,17 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
-	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
+	Server struct {
+		// MetricsEnabled 是否采集按模型的请求统计并落盘时间序列（默认 true）。
+		// 关闭后 /v1/stats 仍返回进程内累计统计，但不返回 series_buckets/range，
+		// 社区面板的「时间趋势」显示未启用占位（其余功能不受影响）。
+		MetricsEnabled bool `json:"metrics_enabled"`
+		// MetricsFile 统计持久化文件；空 = 纯内存（重启清零）。默认 ./data/metrics.json，
+		// 与 state.json 同目录（Docker ./data volume，重启后历史不丢）。
+		MetricsFile string `json:"metrics_file"`
+		// MetricsRetentionDays 时间序列（按小时桶）保留天数，默认 30。<=0 回落默认。
+		MetricsRetentionDays int `json:"metrics_retention_days"`
+	} `json:"server"` // 注意：max_body_mb 已退役，该段下旧键因 JSON 未知字段而自然忽略
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -207,6 +217,11 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// 请求统计（/v1/stats 的时间趋势数据源）：默认开启、落盘 ./data/metrics.json
+	// （与 state.json 同目录，Docker ./data volume 持久化）、时间序列保留 30 天。
+	c.Server.MetricsEnabled = true
+	c.Server.MetricsFile = "./data/metrics.json"
+	c.Server.MetricsRetentionDays = 30
 	return c
 }
 
@@ -339,6 +354,11 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
+	}
+	// 时间序列保留天数：<=0 回落默认 30（与 pool 各阈值同风格：非法/未设置都给默认，
+	// 而不是让 stats 的时间轴悄悄退化成"什么都不保留"）。
+	if c.Server.MetricsRetentionDays <= 0 {
+		c.Server.MetricsRetentionDays = 30
 	}
 	// 连败降权参数缺省归一（非法/未设置回落默认，与 breaker_threshold 同风格）。
 	if c.Pool.DegradeThreshold <= 0 {
