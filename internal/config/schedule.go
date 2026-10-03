@@ -65,6 +65,57 @@ type Schedule struct {
 	CatRandomStart   string `json:"cat_random_start"` // 缺省 "23:00"
 	CatRandomEnd     string `json:"cat_random_end"`   // 缺省 "02:00"
 	CatRandomCount   int    `json:"cat_random_count"` // 缺省 3；<=0 归一为 3
+
+	// Spread 反指纹铺开（多账号时才有意义，单账号可关）。
+	//
+	// 背景：随机窗口只打散了「每天几点触发」，没有打散「同一批账号的处理形状」。
+	// 实测 7 个号共享同一槽位、签到循环内一个 sleep 都没有（2N 个请求挤在 1 秒内）、
+	// 旅行/活跃是固定 800ms/1500ms、Pool.List() 走 sort.Strings → 每天同一秒、
+	// 同一顺序、同一毫秒间隔。这是比「同一分钟」严重得多的机器特征。
+	//
+	// 语义（详见 internal/scheduler/spread.go）：打散的是「整组同步」，
+	// 保留「每号作息稳定」——每号一个由 uid 派生的稳定日偏移，跨日不变，
+	// 于是相邻两天的间隔 = base 差，偏移在差分里抵消，猫猫旅行 ~24h 行程不受影响。
+	Spread Spread `json:"spread"`
+}
+
+// Spread 账号铺开参数。Enabled 缺省 false（老 config 零影响）；启用后各数值项
+// 缺省/非正时由 Normalize 归一到 DefaultSpread 的对应值。
+type Spread struct {
+	Enabled bool `json:"enabled"`
+	// AccountSpreadMin 每号稳定日偏移的铺开范围（分钟）。偏移 = hash(uid,任务族) % 该值，
+	// 跨日稳定。整批维护任务的最长占用约 4×(该值+抖动)+账号数×单号开销，
+	// 随机窗口基准时刻会自动预留这段（见 scheduler.batchReserve）。
+	AccountSpreadMin int `json:"account_spread_minutes"`
+	// AccountJitterSec 偏移之上的随机抖动上限（秒），让每号也不是精确的钟。
+	AccountJitterSec int `json:"account_jitter_seconds"`
+	// Min/MaxAccountDelaySec 账号间随机间隔区间（秒），取代固定 800ms。
+	MinAccountDelaySec int `json:"min_account_delay_seconds"`
+	MaxAccountDelaySec int `json:"max_account_delay_seconds"`
+	// Min/MaxReportGapSec 同一账号内连续上报的随机间隔区间（秒），取代固定 1500ms。
+	MinReportGapSec int `json:"min_report_gap_seconds"`
+	MaxReportGapSec int `json:"max_report_gap_seconds"`
+	// ShuffleAccounts 遍历顺序打乱，消除 Pool.List() 的 UID 字典序特征。
+	ShuffleAccounts bool `json:"shuffle_accounts"`
+}
+
+// DefaultSpread 铺开默认值。
+//
+// 取值受一条硬约束限制：Run 主循环是**阻塞式**的（runBatch 等所有任务族收尾才回
+// nextWake），整批维护任务（签到→旅行→活跃→保活顺序跑）的墙钟时长不能太长，
+// 否则会挤掉同窗口的开学季/夜猫子时点。故铺开按分钟级而非小时级给：
+// 默认 4 分钟铺开 → 整批约 12~15 分钟，仍远小于 15 小时的随机窗口。
+func DefaultSpread() Spread {
+	return Spread{
+		Enabled:            false,
+		AccountSpreadMin:   4,
+		AccountJitterSec:   90,
+		MinAccountDelaySec: 3,
+		MaxAccountDelaySec: 15,
+		MinReportGapSec:    2,
+		MaxReportGapSec:    6,
+		ShuffleAccounts:    true,
+	}
 }
 
 // DefaultSchedule 返回排程段的默认值。
@@ -95,6 +146,35 @@ func DefaultSchedule() Schedule {
 		CatRandomStart:      "23:00",
 		CatRandomEnd:        "02:00",
 		CatRandomCount:      3,
+		Spread:              DefaultSpread(), // Enabled 缺省 false，数值项预置供 Normalize 补齐
+	}
+}
+
+// NormalizeSpread 归一化铺开段：Enabled=true 时，缺省/非正/倒置的数值项回落
+// DefaultSpread 对应值；Max<=Min 一律抬到 Min（宁可窄不可反，randDelay 已兜底）。
+// Enabled=false 时原样保留用户显式配的值——关掉再打开无需重配。
+func (s *Schedule) NormalizeSpread() {
+	if !s.Spread.Enabled {
+		return
+	}
+	d := DefaultSpread()
+	if s.Spread.AccountSpreadMin <= 0 {
+		s.Spread.AccountSpreadMin = d.AccountSpreadMin
+	}
+	if s.Spread.AccountJitterSec <= 0 {
+		s.Spread.AccountJitterSec = d.AccountJitterSec
+	}
+	if s.Spread.MinAccountDelaySec <= 0 {
+		s.Spread.MinAccountDelaySec = d.MinAccountDelaySec
+	}
+	if s.Spread.MaxAccountDelaySec < s.Spread.MinAccountDelaySec {
+		s.Spread.MaxAccountDelaySec = d.MaxAccountDelaySec
+	}
+	if s.Spread.MinReportGapSec <= 0 {
+		s.Spread.MinReportGapSec = d.MinReportGapSec
+	}
+	if s.Spread.MaxReportGapSec < s.Spread.MinReportGapSec {
+		s.Spread.MaxReportGapSec = d.MaxReportGapSec
 	}
 }
 
@@ -133,6 +213,7 @@ func (s *Schedule) Normalize() error {
 	if s.CatRandomCount <= 0 {
 		s.CatRandomCount = 3
 	}
+	s.NormalizeSpread()
 	return s.validateHours()
 }
 

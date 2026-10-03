@@ -120,6 +120,33 @@ web-search-deepseek:
 
 六类任务独立排程、独立开关（`schedule.*_enabled`），互不影响。
 
+### 账号铺开（`schedule.spread`，多账号防检测）
+
+随机窗口只打散了「每天几点触发」，没打散「同一批账号的处理形状」。实测多账号时
+原本是：签到循环内**一个 sleep 都没有**（2N 个请求挤在 1 秒内）、旅行/活跃是固定
+800ms / 1500ms、`Pool.List()` 走 `sort.Strings` → 每天同一秒、同一顺序、同一毫秒间隔。
+
+`schedule.spread.enabled=true` 后：
+
+| 项 | 做法 | 默认 |
+|---|---|---|
+| 每号稳定日偏移 | `hash(uid, 任务族) % account_spread_minutes`，**跨日不变** | 4 分钟 |
+| 偏移上的抖动 | 每轮重随机 `0..account_jitter_seconds` | 90 秒 |
+| 账号间间隔 | `[min,max]` 随机，取代固定 800ms | 3~15 秒 |
+| 账号内上报间隔 | `[min,max]` 随机，取代固定 1500ms | 2~6 秒 |
+| 遍历顺序 | 随机打乱，消除 UID 字典序特征 | 开 |
+
+**为什么偏移必须跨日稳定**：相邻两天的间隔 `= (base₂+off) − (base₁+off) = base₂−base₁`，
+偏移在差分里**相互抵消**，猫猫旅行 ~24h 的行程节奏完全不受影响。若改成每天重随机，
+间隔方差会叠加到 base 之上，可能短于行程时长 → 状态卡 `traveling` → 当日领奖落空。
+
+**代价**：`Run` 主循环是阻塞式的（`runBatch` 等四类任务收尾才回 `nextWake`），整批墙钟
+从约 3 分钟涨到约 25 分钟。随机窗口基准会自动预留出这段（`batchReserve`），保证批尾不
+落进夜猫窗口把夜猫子时点挤掉；代价是开学季时点被整批吞掉的概率从约 0.2%/天升到约
+1.6%/天（基点落在上午 08:33~11:00 且与开学季随机时刻重叠）。想调就调 `account_spread_minutes`。
+
+单账号部署无需开启（`Enabled` 缺省 false，老 config 零影响）。
+
 ### 双域适配
 
 - 同时适配**国内版（CN，`copilot.tencent.com` / `www.codebuddy.cn`）与国际版（Global，`www.workbuddy.ai`）**账号

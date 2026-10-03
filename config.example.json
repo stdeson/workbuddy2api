@@ -33,7 +33,17 @@
     "activity_enabled": true,
     "keepalive_enabled": true,
     "school_enabled": true,
-    "cat_enabled": true
+    "cat_enabled": true,
+    "spread": {
+      "enabled": false,
+      "account_spread_minutes": 4,
+      "account_jitter_seconds": 90,
+      "min_account_delay_seconds": 3,
+      "max_account_delay_seconds": 15,
+      "min_report_gap_seconds": 2,
+      "max_report_gap_seconds": 6,
+      "shuffle_accounts": true
+    }
   },
   "admin": {
     "enabled": false

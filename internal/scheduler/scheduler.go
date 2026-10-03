@@ -72,6 +72,18 @@ type Config struct {
 	CatRandomStartMin int
 	CatRandomEndMin   int
 	CatRandomCount    int
+
+	// ---- 反指纹铺开（spread.go）----
+	//
+	// 零值（AccountSpread<=0）即全关，行为与引入前逐字一致，老 config 无需改动。
+	// 语义见 spread.go 顶部：打散的是「整组同步」，保留「每号作息稳定」。
+	AccountSpread   time.Duration // 每号稳定日偏移的铺开范围（uid 派生，跨日不变）
+	AccountJitter   time.Duration // 偏移之上的随机抖动上限
+	MinAccountDelay time.Duration // 账号间随机间隔下界（取代固定 800ms）
+	MaxAccountDelay time.Duration // 账号间随机间隔上界
+	MinReportGap    time.Duration // 账号内连续上报随机间隔下界（取代固定 1500ms）
+	MaxReportGap    time.Duration // 账号内连续上报随机间隔上界
+	ShuffleAccounts bool          // 遍历顺序打乱（消除 Pool.List 的 UID 字典序特征）
 }
 
 // Scheduler 调度器。
@@ -264,6 +276,12 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	return earliest, kinds
 }
 
+// checkinAccountDelay 签到账号间等待。铺开引入前签到循环**完全没有等待**：
+// N 个号背靠背、2N 个请求（daily-checkin + user-resource）挤在 1 秒内，
+// 是全链路最刺眼的机器特征。铺开开启时改走 accountDelay 的随机区间；
+// 保留这个变量是为了沿用「测试可置 0」的旧钩子口径。
+var checkinAccountDelay time.Duration
+
 // wakeupGraceDelay 迟到唤醒补跑的派发前网络宽限：Windows Modern Standby exit 后
 // 网络栈/DNS 1-2s 才恢复（issue #152 实测 dial tcp lookup no such host 与
 // Kernel-Power 507 standby exit ≤1s 重合），宽限 5s 覆盖 90%+ 唤醒场景。
@@ -316,9 +334,19 @@ func (s *Scheduler) pickRandomOccurrence(now time.Time) time.Time {
 }
 
 // randomInWindow 返回指定 CST 自然日 [start,end] 分钟区间内的随机整分时刻。
+// 启用铺开时上界收窄 batchReserve：Run 主循环阻塞式等整批收尾，基准时刻若不预留
+// 批次时长，批尾会落进夜猫窗口把夜猫子时点挤掉。收窄后基准更早，批次时长不变。
 func (s *Scheduler) randomInWindow(day string) time.Time {
 	t, _ := time.ParseInLocation("2006-01-02", day, cstZone)
-	span := s.randomEndMin - s.randomStartMin
+	// 预留**向上取整**到整分：基准时刻只精确到分，截断会让
+	// 「基准+实际批次」比窗口上界多出不足一分钟的尾巴。
+	reserve := s.batchReserve()
+	reserveMin := int((reserve + time.Minute - 1) / time.Minute)
+	end := s.randomEndMin - reserveMin
+	if end <= s.randomStartMin {
+		end = s.randomStartMin // 窗口比一批还短：退化为起点，宁可挤也不漏
+	}
+	span := end - s.randomStartMin
 	offset := s.randomStartMin + rand.Intn(span+1)
 	return time.Date(t.Year(), t.Month(), t.Day(), offset/60, offset%60, 0, 0, cstZone)
 }
@@ -468,7 +496,7 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 	switch k {
 	case taskCheckin:
-		s.RunCheckinNow()
+		s.runCheckinNowCtx(ctx)
 	case taskTravel:
 		s.runTravel(ctx)
 	case taskActivity:
@@ -481,7 +509,7 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 		s.RunCatNow()
 	case taskRandom:
 		// 随机窗口触发：签到(刷新+解冻) → 旅行 → 活跃上报 → 保活，合并为一趟
-		s.RunCheckinNow()
+		s.runCheckinNowCtx(ctx)
 		s.runTravel(ctx)
 		s.runActivity(ctx)
 		s.RunKeepaliveNow()
@@ -495,6 +523,14 @@ func (s *Scheduler) RunCheckinNow() {
 	}
 }
 
+// runCheckinNowCtx 同 RunCheckinNow，但把 ctx 传进遍历——铺开开启时账号间要等待
+// 稳定日偏移 + 抖动，优雅停机不必等铺开睡满（剩余账号下轮再巡）。
+func (s *Scheduler) runCheckinNowCtx(ctx context.Context) {
+	if _, err := s.checkinAll(ctx); err != nil {
+		log.Printf("scheduled checkin skipped: %v", err)
+	}
+}
+
 // CheckinAll 全量签到：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
 // 同一时刻只允许一次签到在跑，重复调用返回 ErrBusy（防止手动触发与定时撞车重复打上游）。
@@ -502,14 +538,21 @@ func (s *Scheduler) RunCheckinNow() {
 // session dead 走 Pool.NoteSessionDead 的**连续计数**语义（与 keepalive 一致）：
 // 一次刷新失败不再立即杀号，连续 sessionDeadThreshold 次才禁用，刷新成功清计数。
 func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
+	return s.checkinAll(context.Background())
+}
+
+func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 	if !s.checkinMu.TryLock() {
 		return nil, ErrBusy
 	}
 	defer s.checkinMu.Unlock()
 
-	statuses := s.cfg.Pool.List()
+	// 铺开开启时打乱遍历顺序：Pool.List() 是 sort.Strings 字典序，不打乱则每天
+	// 「同一顺序 + 等间隔」是最容易被机器识别的形状（见 spread.go）。
+	statuses := maybeShuffle(s.cfg.Pool.List(), s.cfg.ShuffleAccounts)
 	out := make([]CheckinOutcome, 0, len(statuses))
 	var okN, alreadyN, failN, skipN int
+	first := true
 	for _, st := range statuses {
 		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
 		if st.Disabled {
@@ -534,6 +577,18 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			out = append(out, oc)
 			continue
 		}
+		// 铺开：走完上面所有 skip 分支（不打上游的号不占等待）后，才等本号的
+		// 稳定日偏移 + 抖动。签到原本**一个 sleep 都没有**，N 个号背靠背、
+		// 2N 个请求挤在 1 秒内——这是最刺眼的机器特征。
+		if !first {
+			if !sleepCtx(ctx, s.accountDelay(&checkinAccountDelay)) {
+				break // 优雅停机：剩余账号下轮再巡
+			}
+			if !s.waitAccountTurn(ctx, st.UID, "checkin") {
+				break
+			}
+		}
+		first = false
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
@@ -635,10 +690,11 @@ func (s *Scheduler) RunActivityNow() {
 }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
+// 铺开开启时：遍历顺序打乱 + 每号稳定日偏移/抖动 + 账号间与账号内间隔随机（见 spread.go）。
 func (s *Scheduler) runActivity(ctx context.Context) {
 	count := s.cfg.ActivityReportCount
 	first := true
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range maybeShuffle(s.cfg.Pool.List(), s.cfg.ShuffleAccounts) {
 		if st.Disabled {
 			continue
 		}
@@ -650,8 +706,11 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
 		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
 		if !first {
-			if !sleepCtx(ctx, activityAccountDelay) {
+			if !sleepCtx(ctx, s.accountDelay(&activityAccountDelay)) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
+			}
+			if !s.waitAccountTurn(ctx, st.UID, "activity") {
+				return
 			}
 		}
 		first = false
@@ -668,7 +727,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			ok++
 			if i < count {
 				// 账号内 5 条之间间隔，避免秒发风控；取消时立即放弃本号剩余条数。
-				if !sleepCtx(ctx, activityReportGap) {
+				if !sleepCtx(ctx, s.reportGapDelay(&activityReportGap)) {
 					return
 				}
 			}

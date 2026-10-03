@@ -211,6 +211,29 @@ func main() {
 		}
 	}
 
+	// 反指纹铺开：多账号时把「同一秒/同序/等间隔」打散成「每号各有作息 + 间隔不规则」。
+	// Enabled=false 时下面全部零值，scheduler 侧走固定间隔旧行为（老 config 零影响）。
+	var (
+		spSpread, spJitter time.Duration
+		spMinDelay         time.Duration
+		spMaxDelay         time.Duration
+		spMinGap, spMaxGap time.Duration
+		spShuffle          bool
+	)
+	if cfg.Schedule.Spread.Enabled {
+		sp := cfg.Schedule.Spread
+		spSpread = time.Duration(sp.AccountSpreadMin) * time.Minute
+		spJitter = time.Duration(sp.AccountJitterSec) * time.Second
+		spMinDelay = time.Duration(sp.MinAccountDelaySec) * time.Second
+		spMaxDelay = time.Duration(sp.MaxAccountDelaySec) * time.Second
+		spMinGap = time.Duration(sp.MinReportGapSec) * time.Second
+		spMaxGap = time.Duration(sp.MaxReportGapSec) * time.Second
+		spShuffle = sp.ShuffleAccounts
+		log.Printf("账号铺开已启用：每号稳定日偏移 %v（uid 派生，跨日不变）+ 抖动 ≤%v，"+
+			"账号间 %v~%v，账号内上报 %v~%v，遍历顺序打乱=%v",
+			spSpread, spJitter, spMinDelay, spMaxDelay, spMinGap, spMaxGap, spShuffle)
+	}
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:                 p,
 		Upstream:             up,
@@ -238,6 +261,13 @@ func main() {
 		CatRandomStartMin:    catRS,
 		CatRandomEndMin:      catRE,
 		CatRandomCount:       catRC,
+		AccountSpread:        spSpread,
+		AccountJitter:        spJitter,
+		MinAccountDelay:      spMinDelay,
+		MaxAccountDelay:      spMaxDelay,
+		MinReportGap:         spMinGap,
+		MaxReportGap:         spMaxGap,
+		ShuffleAccounts:      spShuffle,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:

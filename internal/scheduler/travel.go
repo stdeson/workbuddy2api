@@ -23,13 +23,16 @@ const (
 )
 
 // travelAccountDelay 账号间限速：全量账号约 40s，避免上游风控。测试可置 0。
+//
+// 铺开开启（AccountSpread>0）时**不再用这个固定值**——等间隔本身就是最强的机器
+// 特征，改走 interAccountDelay() 的 [MinAccountDelay,MaxAccountDelay] 随机值。
 var travelAccountDelay = 800 * time.Millisecond
 
 // activityAccountDelay 活跃上报账号间限速：与旅行同口径，避免上游风控。测试可置 0。
 var activityAccountDelay = 800 * time.Millisecond
 
 // activityReportGap 同一账号内连续上报之间的间隔：5 连发模拟同一会话多轮对话，
-// 秒发易触发风控，故 1.5s 一条。测试可置 0。
+// 秒发易触发风控，故 1.5s 一条。测试可置 0。铺开开启时改走 reportGapDelay() 随机值。
 var activityReportGap = 1500 * time.Millisecond
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等 sleep 醒来），
@@ -68,10 +71,11 @@ func (s *Scheduler) RunTravelNow() {
 
 // runTravel 旅行巡检遍历，随 ctx 取消立即退出。
 // 禁用账号跳过；401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
-// 账号间限速 travelAccountDelay（sleepCtx：取消时立即放弃后续账号）。
+// 账号间限速 s.accountDelay（铺开开启时为随机区间，关闭时为固定 travelAccountDelay），
+// 再叠本号的稳定日偏移 + 抖动（sleepCtx：取消时立即放弃后续账号）。
 func (s *Scheduler) runTravel(ctx context.Context) {
 	first := true
-	for _, st := range s.cfg.Pool.List() {
+	for _, st := range maybeShuffle(s.cfg.Pool.List(), s.cfg.ShuffleAccounts) {
 		if st.Disabled {
 			continue
 		}
@@ -83,8 +87,11 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 			continue // D4 门控：global 无猫猫旅行体系，不发起任何上游调用
 		}
 		if !first {
-			if !sleepCtx(ctx, travelAccountDelay) {
+			if !sleepCtx(ctx, s.accountDelay(&travelAccountDelay)) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再巡
+			}
+			if !s.waitAccountTurn(ctx, st.UID, "travel") {
+				return
 			}
 		}
 		first = false
