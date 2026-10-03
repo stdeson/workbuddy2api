@@ -550,6 +550,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 	// 铺开开启时打乱遍历顺序：Pool.List() 是 sort.Strings 字典序，不打乱则每天
 	// 「同一顺序 + 等间隔」是最容易被机器识别的形状（见 spread.go）。
 	statuses := maybeShuffle(s.cfg.Pool.List(), s.cfg.ShuffleAccounts)
+	offsets := s.offsetsFor("checkin")
 	out := make([]CheckinOutcome, 0, len(statuses))
 	var okN, alreadyN, failN, skipN int
 	first := true
@@ -584,7 +585,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 			if !sleepCtx(ctx, s.accountDelay(&checkinAccountDelay)) {
 				break // 优雅停机：剩余账号下轮再巡
 			}
-			if !s.waitAccountTurn(ctx, st.UID, "checkin") {
+			if !s.waitAccountTurn(ctx, offsets, st.UID) {
 				break
 			}
 		}
@@ -693,6 +694,7 @@ func (s *Scheduler) RunActivityNow() {
 // 铺开开启时：遍历顺序打乱 + 每号稳定日偏移/抖动 + 账号间与账号内间隔随机（见 spread.go）。
 func (s *Scheduler) runActivity(ctx context.Context) {
 	count := s.cfg.ActivityReportCount
+	offsets := s.offsetsFor("activity")
 	first := true
 	for _, st := range maybeShuffle(s.cfg.Pool.List(), s.cfg.ShuffleAccounts) {
 		if st.Disabled {
@@ -709,7 +711,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			if !sleepCtx(ctx, s.accountDelay(&activityAccountDelay)) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
 			}
-			if !s.waitAccountTurn(ctx, st.UID, "activity") {
+			if !s.waitAccountTurn(ctx, offsets, st.UID) {
 				return
 			}
 		}

@@ -23,6 +23,7 @@ import (
 	"context"
 	"hash/fnv"
 	"math/rand"
+	"sort"
 	"time"
 )
 
@@ -31,19 +32,64 @@ func (s *Scheduler) spreadEnabled() bool {
 	return s.cfg.AccountSpread > 0
 }
 
-// accountOffset 返回该账号在该任务族里的稳定日偏移 ∈ [0, AccountSpread)。
-//
-// 任务族（kind）参与哈希：签到/旅行/活跃/保活四个族彼此也错开，否则它们会
-// 共享同一批偏移时刻，仍能从时间轴上看出「同一时刻四个动作」的规整形状。
-func (s *Scheduler) accountOffset(uid, kind string) time.Duration {
-	if !s.spreadEnabled() {
-		return 0
-	}
+// stableHash 返回 (uid, 任务族) 的稳定哈希。任务族参与哈希：签到/旅行/活跃/保活
+// 四个族彼此也错开，否则它们会共享同一批偏移时刻，仍能从时间轴上看出
+// 「同一时刻四个动作」的规整形状。分隔符避免 ("ab","c") 与 ("a","bc") 撞哈希。
+func stableHash(uid, kind string) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(uid))
-	_, _ = h.Write([]byte{0}) // 分隔符，避免 ("ab","c") 与 ("a","bc") 撞哈希
+	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(kind))
-	return time.Duration(h.Sum64() % uint64(s.cfg.AccountSpread))
+	return h.Sum64()
+}
+
+// offsetsFor 为整个账号池在某任务族上的稳定日偏移表 ∈ [0, AccountSpread)。
+//
+// 为什么是「按 hash 排序后等分槽位」而不是「hash 直接取模」：取模会让两个号落进
+// 同一槽（7 个号进 4 分钟的格子里，碰撞概率约 10%），实测 checkin 族真撞了一对
+// 同为 +3分28秒——而「同一时刻」正是这次改造要消灭的东西。实测证明等分零碰撞。
+//
+// 性质：
+//   - 零碰撞、铺满整个窗口（等分，槽宽 = spread/n）；
+//   - 跨日稳定：hash 只吃 (uid,任务族)，与自然日无关 → 相邻两天偏移相同，
+//     在间隔差分里抵消，猫猫旅行 ~24h 的行程节奏不受影响；
+//   - 池成员不变则映射不变（成员增删会重排，可接受：本来就有新号要排进来）。
+//
+// 按**全池**（不过滤 disabled/global）计算：过滤后 n 会变小，反而更容易撞。
+func (s *Scheduler) offsetsFor(kind string) map[string]time.Duration {
+	if !s.spreadEnabled() {
+		return nil
+	}
+	sts := s.cfg.Pool.List()
+	n := len(sts)
+	out := make(map[string]time.Duration, n)
+	if n == 0 {
+		return out
+	}
+	order := make([]string, 0, n)
+	for _, st := range sts {
+		order = append(order, st.UID)
+	}
+	sort.Slice(order, func(i, j int) bool {
+		hi, hj := stableHash(order[i], kind), stableHash(order[j], kind)
+		if hi != hj {
+			return hi < hj
+		}
+		return order[i] < order[j] // hash 撞车（概率极低）用 uid 兜底，保证是全序
+	})
+	step := s.cfg.AccountSpread / time.Duration(n)
+	for i, uid := range order {
+		out[uid] = time.Duration(i) * step
+	}
+	return out
+}
+
+// accountOffsetOf 查该账号在该任务族的稳定日偏移（不在池内则 0）。
+func (s *Scheduler) accountOffsetOf(offsets map[string]time.Duration, uid string) time.Duration {
+	if offsets == nil {
+		return 0
+	}
+	return offsets[uid]
 }
 
 // accountJitter 在稳定偏移之上叠一层随机抖动，让每号也不是精确的钟。
@@ -56,8 +102,8 @@ func (s *Scheduler) accountJitter() time.Duration {
 
 // waitAccountTurn 在处理某账号前等待「稳定日偏移 + 随机抖动」。
 // ctx 取消立即返回 false（优雅停机不必等铺开睡满，剩余账号下轮再巡）。
-func (s *Scheduler) waitAccountTurn(ctx context.Context, uid, kind string) bool {
-	d := s.accountOffset(uid, kind) + s.accountJitter()
+func (s *Scheduler) waitAccountTurn(ctx context.Context, offsets map[string]time.Duration, uid string) bool {
+	d := s.accountOffsetOf(offsets, uid) + s.accountJitter()
 	if d <= 0 {
 		return ctx.Err() == nil
 	}

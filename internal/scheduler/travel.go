@@ -74,6 +74,7 @@ func (s *Scheduler) RunTravelNow() {
 // 账号间限速 s.accountDelay（铺开开启时为随机区间，关闭时为固定 travelAccountDelay），
 // 再叠本号的稳定日偏移 + 抖动（sleepCtx：取消时立即放弃后续账号）。
 func (s *Scheduler) runTravel(ctx context.Context) {
+	offsets := s.offsetsFor("travel")
 	first := true
 	for _, st := range maybeShuffle(s.cfg.Pool.List(), s.cfg.ShuffleAccounts) {
 		if st.Disabled {
@@ -90,7 +91,7 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 			if !sleepCtx(ctx, s.accountDelay(&travelAccountDelay)) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再巡
 			}
-			if !s.waitAccountTurn(ctx, st.UID, "travel") {
+			if !s.waitAccountTurn(ctx, offsets, st.UID) {
 				return
 			}
 		}
