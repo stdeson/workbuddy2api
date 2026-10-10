@@ -62,6 +62,12 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
+	// 图片轮次上浮（见 hoistImageTurnLast）：把「最后一条带图的 user 消息」挪到末尾。
+	// 必须在 normalizeImageURL 之后（形状已归一，检测口径统一），且在 tool 配对之前
+	// （配对清理看到的是最终顺序）。仅搬 user 消息，不动 assistant/tool。
+	if msgs, ok := obj["messages"].([]any); ok {
+		obj["messages"] = hoistImageTurnLast(msgs)
+	}
 	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
@@ -263,6 +269,82 @@ func normalizeImageURL(obj map[string]any) {
 			part["image_url"] = map[string]any{"url": imageURL}
 		}
 	}
+}
+
+// messageHasImagePart 报告单条消息是否携带多模态图片 part（content[] {type:"image_url"}）。
+// 兼容字符串形态（normalizeImageURL 之前）与对象形态。畸形结构一律 false。
+func messageHasImagePart(rawMsg any) bool {
+	msg, ok := rawMsg.(map[string]any)
+	if !ok {
+		return false
+	}
+	parts, ok := msg["content"].([]any)
+	if !ok {
+		return false
+	}
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := part["type"].(string); t == "image_url" || t == "image" {
+			return true
+		}
+	}
+	return false
+}
+
+// isUserMessage 报告消息是否为 user 角色（content 形态不限）。
+func isUserMessage(rawMsg any) bool {
+	msg, ok := rawMsg.(map[string]any)
+	if !ok {
+		return false
+	}
+	role, _ := msg["role"].(string)
+	return role == "user"
+}
+
+// hoistImageTurnLast 把「最后一条带图的 user 消息」挪到 messages 末尾。
+//
+// 背景（2026-10-11 全链路实测，relay 入口抓包 + 直打上游复现）：
+// 上游 cn:hy3 **只认最后一条 user 消息里的图片**。图片所在的消息后面只要还有别的
+// user 消息，它就丢弃图片，并复读一段「the current model does not support images.
+// Content filtered. Please inform user to switch to a multimodal model...」来自我
+// 合理化——该文案**既不在客户端代码里、也不在网关里、更不在系统提示词里**（全库
+// grep 0 命中），是模型自己的模板；因此从"客户端丢图"或"网关丢图"方向排查永远
+// 找不到真凶。
+//
+// DSH（DeepSeek Harness）恰好在用户的图片消息之后追加若干注入块：AGENTS.md 工作区
+// 提醒、Current runtime context、可用技能清单、时间戳、OpenViking 记忆。这些都是
+// user 角色消息，于是图片轮次不再位于末尾 → 稳定丢图。实测对照：
+//   - 图消息是最后一条            → 100% 正确识图；
+//   - 图消息后面接一条「你好」    → 丢图；
+//   - 图消息后面接任一注入块      → 丢图；
+//   - 注入块在前、图消息挪到最后  → 100% 正确识图（三种组合均通过）。
+//
+// 搬动条件刻意保守：仅当图消息之后**全部是无图的 user 消息**时才搬。只要后面出现
+// assistant / tool / 另一张图，就原样返回——真实多轮语义与 tool 配对一律不碰。
+// 无改动时返回原 slice（调用方可直接回写，零拷贝零副作用）。
+func hoistImageTurnLast(msgs []any) []any {
+	last := -1
+	for i, m := range msgs {
+		if isUserMessage(m) && messageHasImagePart(m) {
+			last = i
+		}
+	}
+	if last < 0 || last == len(msgs)-1 {
+		return msgs // 无图 / 图已在末尾：不动
+	}
+	for _, m := range msgs[last+1:] {
+		if !isUserMessage(m) || messageHasImagePart(m) {
+			return msgs // 后面有 assistant/tool/另一张图：不动
+		}
+	}
+	out := make([]any, 0, len(msgs))
+	out = append(out, msgs[:last]...)
+	out = append(out, msgs[last+1:]...)
+	out = append(out, msgs[last])
+	return out
 }
 
 // ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
