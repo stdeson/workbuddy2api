@@ -611,18 +611,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
 	//   - append：开头连续 system/developer 块后插自有提示词，既有消息逐字不动
 	//     （客户端项目规范/工具约定与网关提示词并用，issue #129）。
-	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
+	//   - passthrough + **本指纹**处于降级期：换 Degraded 中性提示词直达，不再先撞 400。
 	//   - passthrough / append 非降级期：透传客户端原始 system（append 则再插一条网关 system）。
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
+	//
+	// ⚠️ 降级期按 **system 指纹**判定（2026-10-21 事故）：旧实现是进程级全局开关，
+	// 任何客户端被拦一次就让当天全体客户端的 system 被换成 Degraded —— tian_yan「问AI」
+	// 的【标的】事实块（1643 字）就是这样在网关处静默消失的，模型只能反问"哪家公司"。
+	// 现在只影响撞过墙的那一个指纹，别的客户端逐字不动。
+	// 指纹必须在任何 Rewrite/Append 之前取 —— 改写会动 messages 内容。
+	sysKey := prompt.SystemFingerprint(body)
 	degradedApplied := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
-	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
+	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.ActiveFor(sysKey) {
 		body = prompt.Append(body, h.cfg.PromptText)
-	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
+	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && sysKey != "" && h.degrade.ActiveFor(sysKey) {
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
+		if h.degrade.ShouldLogApply(sysKey) {
+			log.Printf("WARN: [server] degraded prompt applied fingerprint=%s (client system replaced until %s) — 该客户端的 system 已被换掉，直到该时刻前此指纹的所有请求都看不到原文",
+				sysKey, h.degrade.Deadline(sysKey).In(time.FixedZone("CST", 8*60*60)).Format("2006-01-02 15:04:05"))
+		}
 	}
 
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
@@ -774,17 +785,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
-			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
-			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
+			// 触发**该指纹**的降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试
+			// （append 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
-			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
-				h.degrade.Trigger()
+			// 无 system 的请求（sysKey==""）不降级：没有原文可换，凭空塞一条 Degraded
+			// 提示词只会改变语义、解决不了"用户内容触发审核"，直接走下面的 400。
+			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied && sysKey != "" {
+				h.degrade.TriggerFor(sysKey)
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
 				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
-				log.Printf("WARN: [server] content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+				log.Printf("WARN: [server] content-blocked (likely fingerprint false positive) -> degraded prompt retry fingerprint=%s", sysKey)
 				continue
 			}
 			if kind == upstream.ErrContentBlocked {

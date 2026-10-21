@@ -44,35 +44,80 @@ func TestNextMidnightCSTCrossMonth(t *testing.T) {
 	}
 }
 
-// TestDegradeGateActiveTriggered Active() 在 Trigger 后为 true，过期后为 false。
+// TestDegradeGateActiveTriggered ActiveFor() 在 TriggerFor 后为 true（仅该指纹）。
 func TestDegradeGateActiveTriggered(t *testing.T) {
 	var g degradeGate
-	if g.Active() {
+	if g.ActiveFor("k1") {
 		t.Error("fresh gate should not be active")
 	}
-	g.Trigger()
-	if !g.Active() {
-		t.Error("after Trigger should be active")
+	g.TriggerFor("k1")
+	if !g.ActiveFor("k1") {
+		t.Error("after TriggerFor should be active")
 	}
 }
 
-// TestDegradeGateTriggerNoRenewal 降级期内再次 Trigger 不续期（保持最早触发点的 00:00 重置）。
+// TestDegradeGateTriggerNoRenewal 降级期内再次 TriggerFor 不续期（保持最早触发点的 00:00 重置）。
 func TestDegradeGateTriggerNoRenewal(t *testing.T) {
 	var g degradeGate
-	g.Trigger()
-	first := func() time.Time {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.until
-	}()
-	// 再次 Trigger：仍在降级期内，until 不应改变。
-	g.Trigger()
-	second := func() time.Time {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		return g.until
-	}()
+	g.TriggerFor("k1")
+	first := g.Deadline("k1")
+	// 再次 TriggerFor：仍在降级期内，until 不应改变。
+	g.TriggerFor("k1")
+	second := g.Deadline("k1")
 	if !first.Equal(second) {
-		t.Errorf("Trigger during active should not renew: first=%v second=%v", first, second)
+		t.Errorf("TriggerFor during active should not renew: first=%v second=%v", first, second)
+	}
+}
+
+// TestDegradeGateScopedByFingerprint 2026-10-21 事故的回归锚：降级只能影响
+// **撞过墙的那一个 system 指纹**，别的客户端（如 tian_yan 的【标的】事实块）逐字不动。
+//
+// 事故现场：passthrough 全局降级 → tian_yan 的 system（含【标的】云中马 603130）
+// 被换成 Degraded 中性提示词，模型反问"哪家公司"。
+func TestDegradeGateScopedByFingerprint(t *testing.T) {
+	var g degradeGate
+	g.TriggerFor("clientA")
+	if !g.ActiveFor("clientA") {
+		t.Fatal("triggered fingerprint should be active")
+	}
+	if g.ActiveFor("clientB") {
+		t.Error("other fingerprints must NOT be degraded by someone else's block")
+	}
+	if g.ActiveFor("") {
+		t.Error("empty fingerprint (no client system) must never be degraded")
+	}
+}
+
+// TestDegradeGateExpiry 过期后 ActiveFor 自动失效并清掉条目。
+func TestDegradeGateExpiry(t *testing.T) {
+	var g degradeGate
+	g.TriggerFor("k1")
+	// 人为把截止时刻拨到过去（模拟跨过 00:00）。
+	g.mu.Lock()
+	g.state["k1"].until = time.Now().Add(-time.Second)
+	g.mu.Unlock()
+	if g.ActiveFor("k1") {
+		t.Error("expired entry should not be active")
+	}
+	g.mu.Lock()
+	_, still := g.state["k1"]
+	g.mu.Unlock()
+	if still {
+		t.Error("expired entry should be pruned")
+	}
+}
+
+// TestDegradeGateShouldLogApplyOnce 每个指纹每次降级期只打一行 apply 日志。
+func TestDegradeGateShouldLogApplyOnce(t *testing.T) {
+	var g degradeGate
+	g.TriggerFor("k1")
+	if !g.ShouldLogApply("k1") {
+		t.Error("first apply should log")
+	}
+	if g.ShouldLogApply("k1") {
+		t.Error("second apply in same window should NOT log again")
+	}
+	if g.ShouldLogApply("unknown") {
+		t.Error("untriggered fingerprint should not log")
 	}
 }

@@ -1966,10 +1966,10 @@ func TestContentBlockedStickyDegraded(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("first req code=%d", rec.Code)
 	}
-	// 降级粘性：新请求 Active()=true，body 已被 Rewrite(Degraded)，上游首字节即 200。
+	// 降级粘性：**该指纹**（本请求那条 system "x"）之后直达 Degraded，上游首字节即 200。
 	// 但 fake 上游只对 firstCall 返回 400，之后都 200，无法区分"直达"与"重试"。
-	// 用 degrade.Active() 直接断言粘性生效。
-	if !h.degrade.Active() {
+	// 用 ActiveFor(该指纹) 直接断言粘性生效。
+	if !h.degrade.ActiveFor(degradeKeyFor(t, `[{"role":"system","content":"x"}]`)) {
 		t.Fatal("degrade should be active after trigger")
 	}
 }
@@ -1998,7 +1998,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	if !strings.Contains(body, "blocked by security policy") || !strings.Contains(body, "11128") {
 		t.Errorf("want upstream raw body passthrough in message: %s", body)
 	}
-	if h.degrade.Active() {
+	if h.degrade.ActiveFor(degradeKeyFor(t, `[{"role":"system","content":"old"}]`)) {
 		t.Error("degrade should NOT be active in custom mode")
 	}
 }
@@ -2373,7 +2373,7 @@ func TestNewHandlerPromptDefaultPassthrough(t *testing.T) {
 }
 
 // TestContentBlockedCustomIgnoresActiveDegrade 显式 custom 模式在降级期仍走自有提示词、
-// 不参与降级：先人为触发 degrade.Active()（模拟 passthrough 首遇后进入降级期），
+// 不参与降级：先人为触发**该 system 指纹**的降级（模拟 passthrough 首遇后进入降级期），
 // 再发 custom 请求 → 出站 body 为自有提示词而非 Degraded，且仍不经降级重试。
 //
 // 相交矩阵关键格：degrade gate 是 Handler 级全局状态（handler.go:69），passthrough
@@ -2399,15 +2399,17 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 	const customSys = "我是网关自有提示词"
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: customSys})
 
-	// 人为把降级门拨到激活态（模拟 passthrough 首遇 400 后进入降级期）。
-	h.degrade.Trigger()
-	if !h.degrade.Active() {
-		t.Fatal("precondition: degrade gate should be active after Trigger")
+	// 人为把降级门拨到激活态（模拟 passthrough 首遇 400 后进入降级期）——
+	// 按**该请求的 system 指纹**触发，否则新语义下不会命中（降级只认指纹）。
+	const clientSys = "客户端系统提示词"
+	h.degrade.TriggerFor(degradeKeyFor(t, `[{"role":"system","content":"`+clientSys+`"}]`))
+	if !h.degrade.ActiveFor(degradeKeyFor(t, `[{"role":"system","content":"`+clientSys+`"}]`)) {
+		t.Fatal("precondition: degrade gate should be active for that fingerprint")
 	}
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"`+clientSys+`"},{"role":"user","content":"hi"}]}`)))
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -2559,7 +2561,7 @@ func TestHandlerAppendDegradedActiveReplaces(t *testing.T) {
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "append", PromptText: "网关人格"})
-	h.degrade.Trigger() // 预置降级期（模拟 append 首遇后进入降级窗口）
+	h.degrade.TriggerFor(degradeKeyFor(t, `[{"role":"system","content":"原始指纹"}]`)) // 预置该指纹的降级期（模拟 append 首遇）
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
@@ -2619,8 +2621,8 @@ func TestHandlerAppendContentBlockedTriggersDegrade(t *testing.T) {
 	if strings.Contains(string(bodies[1]), "原始指纹") {
 		t.Errorf("retry body should not contain original system: %s", bodies[1])
 	}
-	if !h.degrade.Active() {
-		t.Error("degrade should be active after content-blocked trigger in append mode")
+	if !h.degrade.ActiveFor(degradeKeyFor(t, `[{"role":"system","content":"原始指纹"}]`)) {
+		t.Error("degrade should be active for that fingerprint after content-blocked trigger in append mode")
 	}
 }
 
@@ -2698,5 +2700,93 @@ func TestHandlerAppendTurnKeyStable(t *testing.T) {
 	}
 	if len(reqIDs) != 1 || reqIDs[0] != want {
 		t.Errorf("X-Conversation-Request-ID=%v want %q (derived from pre-rewrite body)", reqIDs, want)
+	}
+}
+
+// degradeKeyFor 测试辅助：取一段 messages JSON 的 system 指纹（与 handler 同源）。
+// 降级门按指纹作用，测试必须用**同一个**指纹去触发/断言，否则测的是另一格。
+func degradeKeyFor(t *testing.T, messagesJSON string) string {
+	t.Helper()
+	key := prompt.SystemFingerprint([]byte(`{"messages":` + messagesJSON + `}`))
+	if key == "" {
+		t.Fatalf("test body has no system fingerprint: %s", messagesJSON)
+	}
+	return key
+}
+
+// TestDegradeGateDoesNotStripOtherClientsSystem 2026-10-21 事故回归：
+// 客户端 A（带 Claude Code 指纹的 system）被上游内容策略拦一次进入降级期后，
+// 降级**只作用于 A 那一个指纹**；客户端 B（tian_yan「问AI」，system 里是【标的】+行情事实）
+// 必须逐字透传到上游，绝不能被换成 Degraded 中性提示词。
+//
+// 事故现场：旧实现是进程级全局开关，B 的 1643 字事实块在网关处被 Rewrite(Degraded) 抹掉，
+// 模型只收到「通俗解释这公司做什么的？」→ 反问「哪家公司？」，而界面「本次提示词」完好无损。
+func TestDegradeGateDoesNotStripOtherClientsSystem(t *testing.T) {
+	var bodies [][]byte
+	up := newBodyCaptureUpstream(t, &bodies, func(call int, body string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	// A 撞墙（模拟 11-128 指纹误报）：gate 只认 A 的指纹。
+	const sysA = "You are Claude Code, Anthropic's official CLI tool."
+	keyA := degradeKeyFor(t, `[{"role":"system","content":"`+sysA+`"}]`)
+	h.degrade.TriggerFor(keyA)
+
+	// B = tian_yan「问AI」：system 里带【标的】。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[
+			{"role":"system","content":"以下是这只票当前的事实：\n【标的】云中马 603130 · 板块：机器人"},
+			{"role":"user","content":"通俗解释这公司做什么的？"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("want 1 upstream call, got %d", len(bodies))
+	}
+	out := string(bodies[0])
+	if !strings.Contains(out, "云中马 603130") {
+		t.Errorf("tian_yan system must pass through verbatim, got: %s", out)
+	}
+	if strings.Contains(out, prompt.Degraded) {
+		t.Errorf("tian_yan system must NOT be replaced by Degraded prompt, got: %s", out)
+	}
+	// A 自己的降级期不受影响（不因为 B 走通而失效）。
+	if !h.degrade.ActiveFor(keyA) {
+		t.Error("A's degraded window should survive B's request")
+	}
+}
+
+// TestContentBlockedNoSystemDoesNotDegrade 无 system 的请求撞内容拦截 → 不降级重试
+// （没有原文可换，凭空塞 Degraded 只会改语义），直接 400 content_blocked。
+func TestContentBlockedNoSystemDoesNotDegrade(t *testing.T) {
+	calls := 0
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: 400,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"code":11-128,"msg":"blocked by security policy"}`)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Errorf("want exactly 1 upstream call (no degraded retry without system), got %d", calls)
+	}
+	if h.degrade.ActiveFor("") {
+		t.Error("empty fingerprint must never enter degraded state")
 	}
 }
