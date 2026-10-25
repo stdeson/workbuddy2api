@@ -294,15 +294,27 @@ func messageHasImagePart(rawMsg any) bool {
 	return false
 }
 
-// isUserMessage 报告消息是否为 user 角色（content 形态不限）。
-func isUserMessage(rawMsg any) bool {
+// roleOf 取消息的角色（非对象/无角色返回空串）。
+func roleOf(rawMsg any) string {
 	msg, ok := rawMsg.(map[string]any)
 	if !ok {
-		return false
+		return ""
 	}
 	role, _ := msg["role"].(string)
-	return role == "user"
+	return role
 }
+
+// isUserMessage 报告消息是否为 user 角色（content 形态不限）。
+func isUserMessage(rawMsg any) bool { return roleOf(rawMsg) == "user" }
+
+// isAssistantMessage 报告消息是否为 assistant 角色。
+func isAssistantMessage(rawMsg any) bool { return roleOf(rawMsg) == "assistant" }
+
+// isToolMessage 报告消息是否为 tool 角色（工具结果）。
+func isToolMessage(rawMsg any) bool { return roleOf(rawMsg) == "tool" }
+
+// isSystemMessage 报告消息是否为 system 角色。
+func isSystemMessage(rawMsg any) bool { return roleOf(rawMsg) == "system" }
 
 // hoistImageTurnLast 把「最后一条带图的 user 消息」挪到 messages 末尾。
 //
@@ -322,20 +334,38 @@ func isUserMessage(rawMsg any) bool {
 //   - 图消息后面接任一注入块      → 丢图；
 //   - 注入块在前、图消息挪到最后  → 100% 正确识图（三种组合均通过）。
 //
-// 搬动条件刻意保守：仅当图消息之后**全部是无图的 user 消息**时才搬。只要后面出现
-// assistant / tool / 另一张图，就原样返回——真实多轮语义与 tool 配对一律不碰。
+// 搬动条件刻意保守：**只在「最后一条 assistant/tool 之后的收尾段」内搬**，且收尾段里
+// 图消息之后只允许出现「无图的 user 消息」或「system 消息」（DSH 的 system/message-update
+// 注入块）。只要后面出现 assistant / tool / 另一张图，就原样返回——真实多轮语义与 tool
+// 配对一律不碰（图片已经在某一轮被模型看过，后续轮次不需要再搬）。
+//
+// 2026-10-25 补漏：原实现要求「图后全部是无图 user」，于是 DSH 一旦在图后既插 system
+// 注入块又插 user 注入块（实测形状 `[system, user(图+文本), system, user(注入)]`），
+// 判定即 bail out → 图留在第 2 条 → 上游丢图，且表现为「模型回空内容 / 自称看不到图」。
+// system 消息对上游只是追加指令、与 user 轮次顺序无关，允许跨过它是安全的。
 // 无改动时返回原 slice（调用方可直接回写，零拷贝零副作用）。
 func hoistImageTurnLast(msgs []any) []any {
-	last := -1
+	// 收尾段起点：最后一条 assistant/tool 之后。没有则整段都是收尾段。
+	tailStart := 0
 	for i, m := range msgs {
-		if isUserMessage(m) && messageHasImagePart(m) {
+		if isAssistantMessage(m) || isToolMessage(m) {
+			tailStart = i + 1
+		}
+	}
+	// 收尾段内最后一条带图的 user 消息。
+	last := -1
+	for i := tailStart; i < len(msgs); i++ {
+		if isUserMessage(msgs[i]) && messageHasImagePart(msgs[i]) {
 			last = i
 		}
 	}
 	if last < 0 || last == len(msgs)-1 {
-		return msgs // 无图 / 图已在末尾：不动
+		return msgs // 收尾段无图 / 图已在末尾：不动
 	}
 	for _, m := range msgs[last+1:] {
+		if isSystemMessage(m) {
+			continue // system 注入块：可跨过
+		}
 		if !isUserMessage(m) || messageHasImagePart(m) {
 			return msgs // 后面有 assistant/tool/另一张图：不动
 		}

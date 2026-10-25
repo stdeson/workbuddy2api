@@ -49,6 +49,45 @@ func TestHoistImageTurnLastMovesTrailingContext(t *testing.T) {
 	}
 }
 
+// TestHoistImageTurnLastCrossesSystemInjection 2026-10-25 补漏：DSH 在图后**同时**插
+// system 注入块和 user 注入块（实测形状 `[system, user(图+文本), system, user(注入)]`）。
+// 旧实现遇到那个 system 就 bail out，图留在第 2 条 → 上游丢图。system 与 user 轮次
+// 顺序无关，允许跨过。
+func TestHoistImageTurnLastCrossesSystemInjection(t *testing.T) {
+	msgs := []any{
+		txtMsg("system", "sys"),
+		imgMsg("这是什么"),
+		txtMsg("system", "<system-message-update>已切换模型</system-message-update>"),
+		txtMsg("user", "Current runtime context."),
+	}
+	got := hoistImageTurnLast(msgs)
+	if !messageHasImagePart(got[len(got)-1]) {
+		t.Fatalf("image must cross the trailing system injection and land last, got %v", dumpOrder(got))
+	}
+	want := []string{"sys", "<system-message-update>已切换模型</system-message-update>", "Current runtime context."}
+	for i, w := range want {
+		if c, _ := got[i].(map[string]any)["content"].(string); c != w {
+			t.Fatalf("position %d: want %q, got %q (order=%v)", i, w, c, dumpOrder(got))
+		}
+	}
+}
+
+// TestHoistImageTurnLastStaysInsideTrailingRun 图片在**上一轮**（后面已有 assistant/tool）
+// 时绝不搬动：那一轮模型已经看过图，搬出来会打乱对话因果。
+func TestHoistImageTurnLastStaysInsideTrailingRun(t *testing.T) {
+	msgs := []any{
+		txtMsg("system", "sys"),
+		imgMsg("上一轮的问题"),
+		txtMsg("assistant", "上一轮的回答"),
+		txtMsg("user", "这一轮的追问"),
+		txtMsg("system", "<system-message-update>x</system-message-update>"),
+	}
+	got := hoistImageTurnLast(msgs)
+	if messageHasImagePart(got[len(got)-1]) {
+		t.Fatalf("image from a completed turn must NOT be hoisted, got %v", dumpOrder(got))
+	}
+}
+
 // dumpOrder 渲染 messages 的顺序指纹，便于失败信息可读。
 func dumpOrder(msgs []any) []string {
 	out := make([]string, 0, len(msgs))
