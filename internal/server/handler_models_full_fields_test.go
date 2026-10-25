@@ -54,6 +54,11 @@ func TestModelListFullFieldsDynamicCN(t *testing.T) {
 	if entry["supports_reasoning"] != true {
 		t.Errorf("supports_reasoning=%v want true", entry["supports_reasoning"])
 	}
+	// 2026-10-25 修：客户端按 input_modalities 判定读图能力（model.input.includes("image")），
+	// 网关此前不输出该字段导致图被客户端滤成「image omitted」。hy3 支持图 → 必须含 "image"。
+	if mods, ok := entry["input_modalities"].([]string); !ok || len(mods) != 2 || mods[0] != "text" || mods[1] != "image" {
+		t.Errorf("input_modalities=%v want [text image]", entry["input_modalities"])
+	}
 	if entry["supports_tool_call"] != true {
 		t.Errorf("supports_tool_call=%v want true", entry["supports_tool_call"])
 	}

@@ -1141,6 +1141,15 @@ type ModelInfo struct {
 	Efforts        []string // reasoning.supportedEfforts（空=未知/固定档）
 	DefaultEffort  string   // reasoning.defaultEffort（空=未声明，thinking.go 回退硬编码）
 	SupportsImages bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
+	// InputModalities 输入模态数组（["text"] 或 ["text","image"]）。
+	// DSH 客户端（2026-10-25 实测）按 model.input.includes("image") 判定读图能力，
+	// 而 model.input 来自候选对象 inputModalities 字段（adopt(): input:[...inputModalities]）。
+	// 网关此前只透出 supports_images 布尔、从不输出 inputModalities，导致客户端
+	// model.input === undefined → 客户端门禁把图全部滤成文本占位「image omitted」，
+	// 图根本到不了网关（连 hoistImageTurnLast 都救不到）。故按 SupportsImages 补数组：
+	// 支持图 → ["text","image"]，否则 ["text"]（"absent means unknown" 不可取，会退化
+	// 成 unknown 被客户端当不支持；hy3 实测明确支持图，必须显式声明）。
+	InputModalities []string
 
 	// 以下为模型目录全字段补齐（任务书 models-full-fields）：
 	Description       string   // descriptionZh 中文描述
@@ -1183,6 +1192,17 @@ type dynModelEntry struct {
 	} `json:"reasoning"`
 }
 
+// modelInputModalities 把 SupportsImages 布尔翻成客户端读图门禁所需的
+// inputModalities 数组。支持图 → ["text","image"]，否则 ["text"]。
+// 绝不返回 nil：nil 到客户端会被 adopt() 省略成 model.input === undefined，
+// 而 undefined.includes 抛错 → 客户端门禁把图滤成文本占位。
+func modelInputModalities(supportsImages bool) []string {
+	if supportsImages {
+		return []string{"text", "image"}
+	}
+	return []string{"text"}
+}
+
 // modelInfo 按解析条目构造 ModelInfo（dynEntry→ModelInfo 映射的单一事实来源，
 // CN FetchModels 与 global 探测共用，杜绝两域映射漂移）。
 func (m dynModelEntry) modelInfo() ModelInfo {
@@ -1194,6 +1214,7 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 		Efforts:           m.Reasoning.SupportedEfforts,
 		DefaultEffort:     m.Reasoning.DefaultEffort,
 		SupportsImages:    m.SupportsImages,
+		InputModalities:   modelInputModalities(m.SupportsImages),
 		Description:       m.Description,
 		Credits:           m.Credits,
 		Tags:              m.Tags,

@@ -68,6 +68,11 @@ func TestFetchModelsParsesFullFields(t *testing.T) {
 	if !mi.SupportsImages {
 		t.Error("SupportsImages=false want true")
 	}
+	// 2026-10-25 修：客户端按 input_modalities 判定读图能力（model.input.includes("image")）。
+	// 支持图的模型必须显式声明 ["text","image"]，否则客户端 model.input 为 undefined → 图被滤成占位。
+	if !sameStrings(mi.InputModalities, []string{"text", "image"}) {
+		t.Errorf("InputModalities=%v want [text image]", mi.InputModalities)
+	}
 	if mi.DefaultEffort != "high" || !sameStrings(mi.Efforts, []string{"low", "high"}) {
 		t.Errorf("DefaultEffort=%q Efforts=%v want high/[low high]", mi.DefaultEffort, mi.Efforts)
 	}

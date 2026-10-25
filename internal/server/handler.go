@@ -304,6 +304,13 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	if mi.SupportsImages {
 		entry["supports_images"] = true // 多模态能力透出
 	}
+	// inputModalities（["text"] / ["text","image"]）每次都写：DSH 客户端按
+	// model.input.includes("image") 判定读图能力，model.input 来自此字段
+	// （adopt(): input:[...inputModalities]）。此前网关只透出 supports_images
+	// 布尔、从不输出 inputModalities，客户端 model.input === undefined → 门禁把图
+	// 全部滤成文本占位「image omitted」，图到不了网关（2026-10-25 实测）。
+	// 必须显式声明，不能省略（省略=unknown=被客户端当不支持）。
+	entry["input_modalities"] = []string(mi.InputModalities)
 	if mi.SupportsReasoning {
 		entry["supports_reasoning"] = true
 	}
