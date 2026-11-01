@@ -13,6 +13,16 @@ type CoolKind int
 const (
 	CoolHard CoolKind = iota // 余额不足 → 冷却到次日 04:00（等签到恢复）
 	CoolSoft                 // 429 → 短冷却
+	// CoolBanned 上游 11140「账号存在异常行为，已被限制使用」→ **长冷却 + 半开探测**。
+	//
+	// 为什么不用永久禁用（Disable）：11140 是**账号级风控**，与请求内容无关
+	// （2026-11-01 实测：同一封禁账号换 4 种 system（无 / 中性 / DSH 身份句 /
+	// 完整 DSH 全文）全部 11140；同一分钟内的健康号 0 次 11140），且**上游会
+	// 自愈**——但自愈时刻不可预测。永久禁用把「暂时封禁」当成「凭证失效」，
+	// 池容量会塌缩到只剩健康号（实测 7 号里 6 号被永久摘除，只剩 1 号扛全量
+	// 流量），期间一个都没恢复。长冷却 + 半开探测让账号在冷却到期后自动回到
+	// 候选池试探一次：恢复即自动归队，仍封则继续冷却（退避加长）。
+	CoolBanned
 )
 
 func (k CoolKind) String() string {
@@ -21,6 +31,8 @@ func (k CoolKind) String() string {
 		return "hard_credit"
 	case CoolSoft:
 		return "soft_rate"
+	case CoolBanned:
+		return "banned_11140"
 	}
 	return "unknown"
 }
@@ -149,6 +161,13 @@ type entry struct {
 	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
+	// bannedStreak 连续 11140 封禁次数（CoolBanned 冷却域的独立计数器）。
+	// 与 fails（熔断用）、softStreak（429 用）三者互不污染：11140 是账号级风控，
+	// 喂给熔断器会把 5xx 语义搅浑；喂给 softStreak 会让 429 限流退避被封禁事件拉长。
+	// 用途：封禁冷却时长按 bannedStreak 退避加长（首次 base，重试翻倍，封顶），
+	// 半开探测成功（NoteSuccess）时清零。持久化（stateAccount.BannedStreak）：
+	// 重启后封禁退避不归零，避免「重启即试探风暴」。
+	bannedStreak int
 	// modelCooldowns 6004 模型级 limit 的**独立**冷却表：model → 该模型的冷却截止/重置。
 	// 与 until（全账号级）正交：6004 只写本表、不写 until，因此多个模型同时 6004 时
 	// 各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——这是
@@ -369,6 +388,10 @@ type stateAccount struct {
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak"`
+	// BannedStreak 连续 11140 封禁次数（封禁冷却的退避指数）。持久化以保留
+	// 「重启后封禁退避不归零」——否则每次重启都会把被封号拉回 base 冷却试探，
+	// 形成重启即试探的风暴。零值也显式写出（运维口径，同 err_total 注释）。
+	BannedStreak int `json:"banned_streak"`
 	// SessionDeadFails 连续 12153 计数（判定 session 死亡的进度）。持久化以保留
 	// 「重启后连续计数继续累计」——上游持续 session dead 时重启归零会重学 2 次失败。
 	// 零值也显式写出（运维口径，见 err_total 注释）。

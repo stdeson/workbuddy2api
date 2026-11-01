@@ -256,6 +256,11 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.sessionDeadFails = 0
 		e.consecutiveFails = 0
 		e.degradeUntil = time.Time{}
+		// 半开探测成功 → 封禁退避归零（issue: 11140 封禁冷却）。
+		// 该账号此前处于 CoolBanned 冷却；成功即证明上游已解封，冷却到期后
+		// 它自然回到候选池（until 已过），bannedStreak 清零让下一次封禁从
+		// base 重新起退避，而不是接着上次的翻倍继续加长。
+		e.bannedStreak = 0
 		p.dirty.Store(true)
 	}
 }

@@ -290,6 +290,95 @@ func (p *Pool) CooldownUntilTomorrow4AM(uid string, reason string) {
 	p.Cooldown(uid, CoolHard, nextDay4AM(now).Sub(now), reason)
 }
 
+// ---------------------------------------------------------------------------
+// 11140 封禁冷却（长冷却 + 半开探测）
+// ---------------------------------------------------------------------------
+
+// 封禁冷却的退避基数与封顶。
+//
+// base 取 6h：上游 11140 的实际封禁时长不可预测（实测同批 7 个号在 10-29
+// 10:57~10:59 内被集中封禁，其中部分在 10-30 / 11-01 仍有 11140 记录，说明
+// 封禁持续至少 48h），但也并非永久——封禁是风控动作，终会解除。base 6h 让
+// 账号在当天内获得 2~4 次试探机会；封顶 48h 避免一个真被永久封的号被无限试探。
+//
+// 退避倍增：每次半开探测仍被封，冷却时长翻倍（6h → 12h → 24h → 48h 封顶），
+// 让「持续封禁」的号安静下来，把在途名额让给健康号；一旦某次探测成功，
+// bannedStreak 清零、冷却解除，账号自动归队。
+const (
+	bannedCooldownBase = 6 * time.Hour
+	bannedCooldownMax  = 48 * time.Hour
+)
+
+// CooldownBanned 处理上游 11140「账号存在异常行为，已被限制使用」：
+// 把账号转入**封禁冷却**（CoolBanned），到期自动半开重试，而不是永久禁用。
+//
+// 与旧的 Disable 语义的差异（这是本次修复的核心）：
+//
+//	旧：Disable → 账号永久退出选号池，只有人工 /admin/accounts/{uid}/revive
+//	    能救。实测 7 个号里 6 个在 10-29 被 11140 永久摘除，此后**一个都没
+//	    自动恢复**，池容量塌缩到 1 个号扛全量流量；而上游其实会自愈，只是
+//	    时刻不可预测。永久禁用等于把「暂时封禁」误判成「凭证失效」。
+//	新：CooldownBanned → 账号进入长冷却（6h 起、翻倍、48h 封顶），冷却到期
+//	    自动回到候选池试探一次。恢复即自动归队，仍封则继续冷却。
+//
+// 半开探测的并发安全性：冷却到期后账号与其他健康号无差别参与选号；若多个
+// 并发请求同时试探同一号，其中一个成功后 NoteSuccess 会清掉 bannedStreak
+// 并解除冷却（见 NoteSuccess），其余并发试探若仍被封则只是再次进入冷却
+// （冷却时长按 streak 翻倍），不会产生雪崩——因为 CoolBanned 账号在冷却中
+// 不参与选号，只有到期那一刻会有一次短暂窗口。
+//
+// 语义说明：本方法**不**触碰 manualDisabled（运维手动停用位），也不清
+// 熔断器 / 6004 模型级冷却表——那些是独立维度，各自由自己的入口管理。
+func (p *Pool) CooldownBanned(uid string, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	e.bannedStreak++
+	// 退避：base * 2^(streak-1)，封顶 bannedCooldownMax。
+	// 用移位而非 math.Pow：streak 越大越容易溢出，移位前先夹到上限。
+	d := bannedCooldownBase
+	if e.bannedStreak > 1 {
+		shift := e.bannedStreak - 1
+		if shift > 16 { // 2^16 * 6h 已经远超封顶，先夹住避免溢出
+			d = bannedCooldownMax
+		} else {
+			d = bannedCooldownBase << uint(shift)
+		}
+	}
+	if d > bannedCooldownMax {
+		d = bannedCooldownMax
+	}
+	e.until = now.Add(d)
+	e.coolKind = CoolBanned
+	e.reason = reason
+	// 账号级冷却（与 429 软冷却同域）：清空 6004 模型级独立冷却表，避免
+	// 上一次模型级限流的豁免泄漏到本次封禁冷却上。
+	e.modelCooldowns = nil
+	// 封禁冷却期间账号不可选，但**不算失败**——不清 fails（熔断计数），
+	// 免得封禁事件把熔断退避也一起拉长（两个域正交）。
+	p.dirty.Store(true)
+}
+
+// BannedCooldownRemaining 返回账号封禁冷却的剩余时间（未处于封禁冷却时返回 0）。
+// 供 /status 与半开探测的可观测性使用。
+func (p *Pool) BannedCooldownRemaining(uid string) time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok || e.coolKind != CoolBanned {
+		return 0
+	}
+	now := time.Now()
+	if e.until.IsZero() || !now.Before(e.until) {
+		return 0
+	}
+	return e.until.Sub(now)
+}
+
 // nextDay4AM 返回 now 之后最近的一个 04:00（与 now 同一时区）。
 // now 在当天 04:00 之前（凌晨 00:00~04:00）时返回当天 04:00——此时签到尚未执行，
 // 该窗内触发的硬冷却等当天签到即可恢复；返回次日会白冷约一天。

@@ -92,6 +92,11 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// banStorm 11140 全局封禁风暴闸门（fail-fast，banstorm.go）：短窗内多个**不同**
+	// 账号命中 11140 → 判定为账号集合级风控，激活期直接终止轮转（不再把剩余账号
+	// 往上游送，避免一次请求烧光整池——2026-10-29 就是这么烧的：86 秒内 7 个号全封）。
+	// 账号级记账仍在 pool（CooldownBanned），闸门只决定「是否继续轮转」。进程内状态。
+	banStorm banStormGate
 }
 
 // NewHandler 构建 handler。
@@ -688,6 +693,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
+		// 11140 全局封禁风暴闸门（fail-fast）：短窗内多个**不同**账号命中 11140 →
+		// 判定为账号集合级风控（2026-10-29 实测 86 秒内 7 个号集体被封）。
+		// 此时继续轮转 = 把剩余账号一个个送上去烧掉（单号冷却只挡住已撞封的那个，
+		// 挡不住下一个）。**不打上游**直接终止，止损优先于用光配额。
+		// 被撞封的账号已在 applyErrorPolicy 里各自进封禁冷却，闸门到期后自动半开探测。
+		if h.banStorm.active() {
+			st.status = http.StatusServiceUnavailable
+			lastErr = &upstream.Error{Kind: upstream.ErrAccountFault, Status: http.StatusServiceUnavailable,
+				Msg: "fleet-level account restriction detected upstream (11140); rotation stopped to avoid tripping risk control on remaining accounts"}
+			break
+		}
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -864,6 +880,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 打同一出口 IP，加重风控。账号级软冷却已在上方 applyErrorPolicy 照常记账
 			// （单号偶发 403 仍冷却），IP 级状态只改变「是否继续轮转」——协同不叠加。
 			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
+				break
+			}
+			// 11140 全局封禁风暴记账：短窗内多个**不同**账号命中 11140 → 激活闸门，
+			// 立即终止本次轮转（不再把剩余账号送上游烧）。单号命中只记账不激活。
+			// 账号级封禁冷却已在 applyErrorPolicy 照常记账（各号独立冷却 + 半开探测）。
+			if kind == upstream.ErrAccountFault && isBannedFault(string(respBody)) && h.banStorm.noteBan(acct.UID) {
 				break
 			}
 			if !rotateBackoff(i, r.Context()) {
@@ -1115,15 +1137,24 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrAccountFault:
 		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
-		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：软冷却到期也不会自动
-		//     恢复（需重新 OAuth 登录），到期后重新选号只会再撞 403 浪费一次轮换——
-		//     硬禁用（Disable），不再参与选号。/status 以 disabled + disabled_reason 呈现。
+		//   - "request illegal"（code 11140）→ 账号级**风控封禁**：转封禁冷却
+		//     （长冷却 6h 起、翻倍、48h 封顶），到期自动半开重试——**不再永久
+		//     禁用**。
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 两条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
-		if strings.Contains(strings.ToLower(body), "request illegal") {
-			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+		//
+		// 为什么 11140 从 Disable 改成封禁冷却（2026-11-01 实测取证）：
+		//   - 11140 与请求内容**无关**：同一个封禁账号换 4 种 system（无 system /
+		//     中性句 / DSH 身份句 / 完整 DSH 全文）全部返回 11140；同一分钟内的
+		//     健康号 0 次 11140。→ 是账号级风控，不是提示词问题。
+		//   - 上游封禁**会自愈**，但自愈时刻不可预测。旧的永久禁用把「暂时封禁」
+		//     当成「凭证失效」：实测 7 个号里 6 个在 10-29 被 11140 永久摘除，
+		//     此后一个都没自动恢复，池容量塌缩到只剩 1 个号扛全量流量。
+		//   - 封禁冷却让账号到期自动试探一次：恢复即归队，仍封则退避加长。
+		if isBannedFault(body) {
+			h.cfg.Pool.CooldownBanned(uid, "account restricted by upstream (11140 request illegal), cooling down until auto-retry")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")

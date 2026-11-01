@@ -101,7 +101,7 @@ func TestChatWaf403HtmlBodySoftCools(t *testing.T) {
 }
 
 // TestChat403BusinessEnvelopeNotWaf 403 带业务信封（code/msg）不走 WAF 分支
-// （P0-1 约束：不劫持业务 403——11140 request illegal 维持 ErrAccountFault 禁用）。
+// （P0-1 约束：不劫持业务 403——11140 request illegal 走 ErrAccountFault 封禁冷却）。
 func TestChat403BusinessEnvelopeNotWaf(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 403, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, false
@@ -111,11 +111,14 @@ func TestChat403BusinessEnvelopeNotWaf(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
 	st, _ := p.Status("u1")
-	if !st.Disabled {
-		t.Fatalf("403+request illegal must disable (ErrAccountFault path), got %+v", st)
+	// 11140 → 封禁冷却（长冷却 + 半开探测），不再是永久禁用：
+	// 账号**不**是 Disabled（它会在冷却到期后自动回到候选池试探），
+	// 而是以 CoolKind=banned_11140 的冷却态呈现。
+	if st.Disabled {
+		t.Fatalf("11140 must not permanently disable (banned cooldown + auto half-open probe): %+v", st)
 	}
-	if st.Cooling {
-		t.Errorf("11140 disable must not stack cooling: %+v", st)
+	if !st.Cooling || st.CoolKind != "banned_11140" {
+		t.Fatalf("11140 must enter banned cooldown: %+v", st)
 	}
 }
 

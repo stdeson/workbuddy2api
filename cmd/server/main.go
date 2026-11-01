@@ -88,6 +88,15 @@ func main() {
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
+	// 旧版 11140 永久禁用状态迁移：修复前把「上游暂时封禁」当成「凭证失效」写进
+	// state.json（disabled=true）。这类账号不会被新逻辑接管——不会被选中 → 不会
+	// 触发新的 11140 → 永远恢复不了。迁移把它们放回池子，让新的「封禁冷却 + 半开
+	// 探测」路径接管：仍被封则进冷却（6h 起、翻倍、48h 封顶），恢复即自动归队。
+	// 只迁旧 11140 文案造成的禁用，不碰 session dead / 余额不足 / 手动停用。
+	if n := p.MigrateLegacyBannedDisabled(); n > 0 {
+		log.Printf("[server] migrated %d account(s) from legacy permanent 11140 disable to recoverable state", n)
+	}
+
 	// auths 目录热加载：新增凭证文件自动进池，免去「加完账号手动重启网关」。
 	// 启动时的 SyncToDir 已建立基线，监听只在后续目录内容变化时触发（见 pool/watch.go）。
 	stopWatch := p.StartAuthDirWatch(cfg.AuthDir)

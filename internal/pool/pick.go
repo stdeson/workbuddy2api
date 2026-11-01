@@ -228,6 +228,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+// CoolBanned（11140 封禁冷却）**排除**：封禁期打上游必然再撞 11140（账号级风控，
+// 与请求内容无关），只会持续触发风控并刷噪音日志。封禁号的归队路径是「冷却到期
+// → 半开探测」，不是「兜底强行拉出来打」。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
 	var best *entry
@@ -243,6 +246,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		}
+		if e.coolKind == CoolBanned && !e.until.IsZero() && now.Before(e.until) {
+			continue // 封禁冷却期不参与兜底：必再撞 11140，等冷却到期走半开探测
 		}
 		if p.inFlightFull(e) {
 			continue

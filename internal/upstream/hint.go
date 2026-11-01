@@ -54,7 +54,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	case ErrSoftRate:
 		return "rate limited by upstream; retry after reset"
 	case ErrAccountFault:
-		return "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"
+		// 措辞不承诺具体处置：11140（账号级风控）走**封禁冷却 + 到期半开探测**
+		// （不是永久禁用），14017（trial 未激活）走软冷却。两者都是「换号 + 冷却」，
+		// 冷却到期后账号会自动回到候选池。
+		return "account-level fault at upstream (auth/quota state); the gateway will rotate this account and cool it down"
 	case ErrSessionDead:
 		return "account session expired at upstream; the account is disabled until re-login"
 	case ErrHardCredit:
