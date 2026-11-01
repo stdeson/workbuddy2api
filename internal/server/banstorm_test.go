@@ -116,8 +116,13 @@ func TestBanStormStopsRotation(t *testing.T) {
 	}
 }
 
-// TestBanStormGateBlocksNextRequest 闸门激活后，后续请求**不打上游**直接 fail-fast。
-func TestBanStormGateBlocksNextRequest(t *testing.T) {
+// TestBanStormPrefersVerifiedHealthyAccount 端到端：闸门激活后，**已验证健康**的号
+// 继续服务（不因闸门被误停），未验证的号不被试探。
+//
+// 这是初版闸门的设计缺陷回归：初版把闸门做成全局 fail-fast，2026-11-01 10:15
+// 生产实测把当时唯一确认健康的账号（lastSuccess 在 banHealthyWindow 内）也一起
+// 停掉，客户端全线 503。现语义：闸门只改选号优先级，不停服务。
+func TestBanStormPrefersVerifiedHealthyAccount(t *testing.T) {
 	old := banStormWindow
 	banStormWindow = 60 * time.Second
 	defer func() { banStormWindow = old }()
@@ -125,31 +130,66 @@ func TestBanStormGateBlocksNextRequest(t *testing.T) {
 	var calls atomic.Int32
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls.Add(1)
-		return 403, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, false
+		if authz == "Bearer at-bad" {
+			return 403, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, false
+		}
+		return 200, sseOK, true
 	})
 	p := testPoolWith(
-		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
-		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
-		&auth.Auth{UID: "u3", AccessToken: "at3", ExpiresAt: 9999999999},
-		&auth.Auth{UID: "u4", AccessToken: "at4", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "fresh", AccessToken: "at-fresh", ExpiresAt: 9999999999},
 	)
 	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 5, SoftCooldown: 90 * time.Second})
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	before := calls.Load()
+	// good 是已验证健康的号：先让它成功一次，刷新 lastSuccess。
+	p.NoteSuccess("good")
 
-	// 闸门已激活（第一个请求就该激活：3 个不同号）。
+	// 先把闸门打起来：连续 3 个**不同**号撞 11140。
+	for _, uid := range []string{"bad", "fresh"} {
+		h.banStorm.noteBan(uid)
+	}
+	h.banStorm.noteBan("other") // 第 3 个不同号 → 闸门激活
 	if !h.banStorm.active() {
 		t.Fatal("gate must be active")
 	}
-	rec2 := httptest.NewRecorder()
-	h.ServeHTTP(rec2, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if after := calls.Load(); after != before {
-		t.Fatalf("gated request must not hit upstream: calls %d -> %d", before, after)
+
+	before := calls.Load()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("gated request must still be served by verified-healthy account: code=%d body=%s", rec.Code, rec.Body)
 	}
-	if rec2.Code != http.StatusServiceUnavailable {
-		t.Fatalf("gated request code=%d want 503", rec2.Code)
+	if calls.Load() <= before {
+		t.Fatal("request must have reached upstream")
+	}
+}
+
+// TestBanStormGatedRequestStillServedByVerifiedHealthy 闸门激活 + 池里只有已验证
+// 健康的号可用 → 请求正常 200（闸门不阻断服务）。
+func TestBanStormGatedRequestStillServedByVerifiedHealthy(t *testing.T) {
+	old := banStormWindow
+	banStormWindow = 60 * time.Second
+	defer func() { banStormWindow = old }()
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 5, SoftCooldown: 90 * time.Second})
+	p.NoteSuccess("good")
+
+	h.banStorm.noteBan("u1")
+	h.banStorm.noteBan("u2")
+	h.banStorm.noteBan("u3")
+	if !h.banStorm.active() {
+		t.Fatal("gate must be active")
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 }
 

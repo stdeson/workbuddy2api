@@ -15,6 +15,19 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 	return p.pick(tried, reqModel, realm)
 }
 
+// PickRecentSuccessForRealm 只在「最近成功过」（lastSuccess 晚于 within 之前）
+// 的账号里选号：用于 11140 全局封禁风暴期——优先用**已验证健康**的号服务，
+// 不去试探尚未验证的号（避免把未知的号一个个送上去撞封）。
+//
+// 无候选时返回 nil（**不走**全冷却兜底）：调用方据此决定是否退回普通选号。
+// within <= 0 退化为普通选号（PickExcludingForRealm 语义）。
+func (p *Pool) PickRecentSuccessForRealm(tried map[string]bool, reqModel, realm string, within time.Duration) *auth.Auth {
+	if within <= 0 {
+		return p.PickExcludingForRealm(tried, reqModel, realm)
+	}
+	return p.pickRecentSuccess(tried, reqModel, realm, time.Now().Add(-within))
+}
+
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
 // DeptestOnly: 仅 realm_test.go 引用；生产经 wiring.go 走
 // AvailableUIDsForModelRealm。保留作 ForModelRealm 的模型维度退化

@@ -36,6 +36,22 @@ func (p *Pool) Pick(model string) *auth.Auth {
 // 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底不参与模型豁免——
 // 兜底本来就是在"无任何 direct 可用"时的降级，切模型可用性已在 normal 阶段体现。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	return p.pickRecentSuccess(tried, reqModel, realm, time.Time{})
+}
+
+// pickRecentSuccess 在 pick 的基础上追加「最近成功过」过滤：候选账号必须
+// lastSuccess 晚于 recentSince（零值 = 不限制）。
+//
+// 用途（11140 全局封禁风暴闸门）：上游判定账号集合级风控时，本地还有
+// 「最近确认成功过」的号可用——它们是**已验证健康**的。让选号优先落在这些号上，
+// 既保住服务（不因闸门把唯一健康号也停掉），又不去试探尚未验证的号
+// （避免把未知的号一个个送上去撞封）。
+//
+// 与 pick 的两处差异（都必须保持）：
+//   - 无候选时**不走**「全冷却兜底」：过滤后为空就返回 nil，让调用方自行决定
+//     是否退回普通选号（兜底会把冷却中的号拉出来打，与「不试探未知号」相悖）。
+//   - 不改变 tried 语义（请求级轮换排除集照常生效）。
+func (p *Pool) pickRecentSuccess(tried map[string]bool, reqModel, realm string, recentSince time.Time) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -49,6 +65,12 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
 		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
+	}
+	if !recentSince.IsZero() {
+		// 「最近成功过」附加谓词：lastSuccess 晚于 recentSince。
+		// 从未成功过（lastSuccess 零值）的号不满足——它正是风暴期要「不试探」的那类。
+		base := healthyOf
+		healthyOf = func(e *entry) bool { return base(e) && e.lastSuccess.After(recentSince) }
 	}
 	var cands []*entry
 	for uid, e := range p.byUID {
@@ -64,6 +86,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
+		if !recentSince.IsZero() {
+			// 带过滤时不做全冷却兜底（见函数注释）：返回 nil 让调用方决定是否退回普通选号。
+			return nil
+		}
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now, realm)

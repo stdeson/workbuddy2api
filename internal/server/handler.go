@@ -693,17 +693,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 11140 全局封禁风暴闸门（fail-fast）：短窗内多个**不同**账号命中 11140 →
-		// 判定为账号集合级风控（2026-10-29 实测 86 秒内 7 个号集体被封）。
-		// 此时继续轮转 = 把剩余账号一个个送上去烧掉（单号冷却只挡住已撞封的那个，
-		// 挡不住下一个）。**不打上游**直接终止，止损优先于用光配额。
-		// 被撞封的账号已在 applyErrorPolicy 里各自进封禁冷却，闸门到期后自动半开探测。
-		if h.banStorm.active() {
-			st.status = http.StatusServiceUnavailable
-			lastErr = &upstream.Error{Kind: upstream.ErrAccountFault, Status: http.StatusServiceUnavailable,
-				Msg: "fleet-level account restriction detected upstream (11140); rotation stopped to avoid tripping risk control on remaining accounts"}
-			break
-		}
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -714,12 +703,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
+			// 11140 全局封禁风暴期：优先选「最近确认成功过」的号——已验证健康的号
+			// 继续服务（不因闸门把唯一能用的号也停掉），同时不去试探尚未验证的号
+			// （避免把未知的号一个个送上去撞封）。闸门激活时**不硬阻断**：
+			// 没有已验证健康的号就退回普通轮转（探测），宁可试一次也不停服。
+			if h.banStorm.active() {
+				acct = h.cfg.Pool.PickRecentSuccessForRealm(tried, bareModel, realm, banHealthyWindow)
+			}
+		}
+		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
+			if h.banStorm.active() {
+				// 风暴期且池里一个可用号都没有（全部在封禁冷却 / 冷却中）：
+				// 给出可读文案，说明是上游账号集合级风控、需等待冷却到期自动半开探测。
+				lastErr = &upstream.Error{Kind: upstream.ErrAccountFault, Status: http.StatusServiceUnavailable,
+					Msg: "fleet-level account restriction detected upstream (11140); no verified account available, waiting for banned-cooldown accounts to auto-retry"}
+			}
 			break
 		}
 		st.uid = acct.UID
